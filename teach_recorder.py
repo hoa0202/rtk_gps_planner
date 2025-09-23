@@ -26,11 +26,16 @@ class TeachRecorder(Node):
         self.declare_parameter('sample_dist', 0.30)            # 샘플 간격 [m]
         self.declare_parameter('origin_lat', 0.0)              # 0이면 첫 fix로 자동 원점 설정
         self.declare_parameter('origin_lon', 0.0)
+        # GPS lever arm (GPS antenna position relative to robot center)
+        self.declare_parameter('lever_ax', -0.64)              # GPS offset from robot center [m]
+        self.declare_parameter('lever_ay', 0.05)
 
         self.save_csv   = self.get_parameter('save_csv').get_parameter_value().string_value
         self.sample_dist= float(self.get_parameter('sample_dist').value)
         self.origin_lat = float(self.get_parameter('origin_lat').value)
         self.origin_lon = float(self.get_parameter('origin_lon').value)
+        self.lever_ax   = float(self.get_parameter('lever_ax').value)
+        self.lever_ay   = float(self.get_parameter('lever_ay').value)
 
         # ENU 근사(이퀴레탱귤러)
         self.R = 6378137.0
@@ -38,10 +43,10 @@ class TeachRecorder(Node):
         self.lat0 = None; self.lon0 = None; self.clat0 = None
 
         # State
-        self.x = None; self.y = None
+        self.x_ant = None; self.y_ant = None  # GPS antenna position
         self.yaw = 0.0
-        self.path = []  # (x,y,yaw)
-        self.last_x = None; self.last_y = None
+        self.path = []  # (x,y,yaw) - robot center positions
+        self.last_x = None; self.last_y = None  # last robot center positions
 
         # ROS IO
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix', self.on_gps, 10)
@@ -63,6 +68,14 @@ class TeachRecorder(Node):
         y = (phi - self.lat0) * self.R
         return x, y
 
+    def base_from_antenna(self, x_ant, y_ant, yaw):
+        """Convert GPS antenna position to robot base center"""
+        if self.lever_ax == 0.0 and self.lever_ay == 0.0: 
+            return x_ant, y_ant
+        dx = self.lever_ax * math.cos(yaw) - self.lever_ay * math.sin(yaw)
+        dy = self.lever_ax * math.sin(yaw) + self.lever_ay * math.cos(yaw)
+        return (x_ant - dx, y_ant - dy)
+
     def on_gps(self, m: NavSatFix):
         if not math.isfinite(m.latitude) or not math.isfinite(m.longitude):
             return
@@ -71,7 +84,7 @@ class TeachRecorder(Node):
                 self.set_origin(self.origin_lat, self.origin_lon)
             else:
                 self.set_origin(m.latitude, m.longitude)
-        self.x, self.y = self.lla2xy(m.latitude, m.longitude)
+        self.x_ant, self.y_ant = self.lla2xy(m.latitude, m.longitude)
 
     def on_imu(self, m: Imu):
         q = m.orientation
@@ -79,18 +92,23 @@ class TeachRecorder(Node):
         self.yaw = y
 
     def spin(self):
-        if self.x is None or self.y is None:
+        if self.x_ant is None or self.y_ant is None:
             return
+        
+        # Convert GPS antenna position to robot center
+        x_base, y_base = self.base_from_antenna(self.x_ant, self.y_ant, self.yaw)
+        
         if self.last_x is None:
-            self.path.append((self.x, self.y, self.yaw))
-            self.last_x, self.last_y = self.x, self.y
+            self.path.append((x_base, y_base, self.yaw))
+            self.last_x, self.last_y = x_base, y_base
             return
-        d = math.hypot(self.x - self.last_x, self.y - self.last_y)
+        
+        d = math.hypot(x_base - self.last_x, y_base - self.last_y)
         if d >= self.sample_dist:
             # Calculate heading from actual movement instead of IMU yaw
-            actual_heading = math.atan2(self.y - self.last_y, self.x - self.last_x)
-            self.path.append((self.x, self.y, actual_heading))  # Use movement-based heading
-            self.last_x, self.last_y = self.x, self.y
+            actual_heading = math.atan2(y_base - self.last_y, x_base - self.last_x)
+            self.path.append((x_base, y_base, actual_heading))  # Use movement-based heading
+            self.last_x, self.last_y = x_base, y_base
 
     def destroy_node(self):
         # Save CSV (첫 줄에 ORIGIN)

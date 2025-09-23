@@ -58,10 +58,10 @@ class RepeatFollower(Node):
         self.declare_parameter('e_tube', 0.25)  # was 0.10
         # Yaw bias & lever
         self.declare_parameter('yaw_bias', 0.0)
-        self.declare_parameter('lever_ax', 0.0)  # GPS offset
-        self.declare_parameter('lever_ay', 0.0)  # GPS offset
-        self.declare_parameter('imu_offset_x', 0.0)  # IMU offset
-        self.declare_parameter('imu_offset_y', 0.0)  # IMU offset
+        self.declare_parameter('lever_ax', -0.64)  # GPS offset from robot center [m]
+        self.declare_parameter('lever_ay', 0.05)   # GPS offset from robot center [m]
+        self.declare_parameter('imu_offset_x', -0.64)  # IMU offset from robot center [m]
+        self.declare_parameter('imu_offset_y', -0.22)  # IMU offset from robot center [m]
         # Near-omega scaling
         self.declare_parameter('omega_near_d0', 0.40)
         # FOLLOW_LOCK distance
