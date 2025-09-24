@@ -45,7 +45,7 @@ class RepeatFollower(Node):
         self.declare_parameter('Td', 0.18)
         # Start/Gate
         self.declare_parameter('pre_gap', 0.60)
-        self.declare_parameter('r_pre', 3.0)  # Very large for any start position
+        self.declare_parameter('r_pre', 1.5)  # Tighter start position for consistency
         self.declare_parameter('yaw_tol', 1.0)  # Much larger angle tolerance
         self.declare_parameter('s_gate', 0.20)
         self.declare_parameter('gate_width', 0.12)
@@ -181,8 +181,8 @@ class RepeatFollower(Node):
         # Simple recording
         self.record_interval = 0.1  # 10Hz recording
         
-        # Dynamic smoothing control
-        self.prev_cross_track = 0.0  # Previous cross-track error for oscillation detection
+        # Consistency control for reproducible experiments
+        self.filtered_ct_error = 0.0  # Filtered cross-track error for noise reduction
 
         # Robot base_link position (calculated from TF transforms ONLY)
         self.x_base = None
@@ -803,34 +803,26 @@ class RepeatFollower(Node):
             # ANTI-CORNER-CUTTING: Add cross-track error compensation
             cross_track_error = self.calculate_cross_track_error(self.x_base, self.y_base, closest_idx)
             
-            # Dynamic cross-track gain based on tracking performance
-            # Detect problematic areas by tracking behavior, not coordinates
-            needs_extra_smoothing = False
+            # CONSISTENT cross-track gain for reproducibility
+            # Use stable, predictable control to ensure experiment consistency
             
-            # 1. Large cross-track error indicates difficult section
-            if abs(cross_track_error) > 0.3:  # More than 30cm off track
-                needs_extra_smoothing = True
-                
-            # 2. Rapid cross-track error oscillation
-            if hasattr(self, 'prev_cross_track'):
-                ct_change_rate = abs(cross_track_error - self.prev_cross_track)
-                if ct_change_rate > 0.2:  # Rapid oscillation between updates
-                    needs_extra_smoothing = True
-            self.prev_cross_track = cross_track_error
+            # Precision-focused curvature-based gain for consistency
+            if abs(curvature) > 0.3:  # Sharp curves
+                ct_gain = 0.10  # Slightly stronger for precision
+                lookahead_dist = 2.0  # Shorter for tight tracking
+            elif abs(curvature) > 0.15:  # Medium curves
+                ct_gain = 0.15  # More aggressive for accuracy
+                lookahead_dist = 2.5  # Balanced
+            else:  # Straight or gentle curves
+                ct_gain = 0.08  # Stronger for precision
+                lookahead_dist = 3.0  # Full lookahead
             
-            # 3. Very high curvature areas
-            if abs(curvature) > 0.4:
-                needs_extra_smoothing = True
+            # Enhanced filtering for precision and consistency
+            # Low-pass filter to reduce noise sensitivity
+            alpha = 0.8  # More responsive to reduce lag (was 0.7)
+            self.filtered_ct_error = alpha * cross_track_error + (1-alpha) * self.filtered_ct_error
             
-            # Apply dynamic gain
-            if needs_extra_smoothing:
-                ct_gain = 0.03  # Extra gentle for problem areas
-            elif abs(curvature) > 0.2:  # Normal curves
-                ct_gain = 0.15  # Moderate correction
-            else:  # Straight sections
-                ct_gain = 0.05  # Gentle correction
-                
-            ct_correction = ct_gain * cross_track_error
+            ct_correction = ct_gain * self.filtered_ct_error
             
             # Limit cross-track correction to prevent overshoot
             ct_correction = max(-0.2, min(0.2, ct_correction))  # ±0.2 rad/s 제한
@@ -845,15 +837,13 @@ class RepeatFollower(Node):
             omega = self.k_th * yaw_error + ct_correction
             omega = max(-1.0, min(1.0, omega))  # Clamp
             
-            # Enhanced debug log with dynamic smoothing info
+            # Enhanced debug log for consistent tracking
             if hasattr(self, '_simple_log') and time.time() - self._simple_log > 1.0:
-                smooth_status = "SMOOTH" if needs_extra_smoothing else "NORMAL"
                 self.get_logger().info(
-                    f'[ADAPT] pos=({self.x_base:.2f},{self.y_base:.2f}), '
+                    f'[CONSIST] pos=({self.x_base:.2f},{self.y_base:.2f}), '
                     f'idx={closest_idx}→{target_idx}, lookahead={lookahead_dist:.1f}m, '
-                    f'curv={curvature:.3f}, ct_err={cross_track_error:.3f}m, '
-                    f'gain={ct_gain:.3f}, mode={smooth_status}, '
-                    f'yaw_err={math.degrees(yaw_error):.1f}°, '
+                    f'curv={curvature:.3f}, ct_raw={cross_track_error:.3f}m, ct_filt={self.filtered_ct_error:.3f}m, '
+                    f'gain={ct_gain:.3f}, yaw_err={math.degrees(yaw_error):.1f}°, '
                     f'v={v_cmd:.2f}, ω={omega:.2f}'
                 )
                 self._simple_log = time.time()
