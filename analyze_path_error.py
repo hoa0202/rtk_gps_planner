@@ -303,9 +303,9 @@ def main():
     print(f"  최대: {np.max(all_max_errors):.3f} m")
     
     # 성공률 계산 (평균 오차 < 0.5m 기준)
-    success_count = sum(1 for exp in valid_experiments if exp['mean_error'] < 0.5)
+    success_count = sum(1 for exp in valid_experiments if exp['mean_error'] < 0.1)
     success_rate = success_count / len(valid_experiments) * 100
-    print(f"\n성공률 (평균 오차 < 0.5m): {success_count}/{len(valid_experiments)} ({success_rate:.1f}%)")
+    print(f"\n성공률 (평균 오차 < 0.1m): {success_count}/{len(valid_experiments)} ({success_rate:.1f}%)")
     
     # 시각화
     print("\n그래프 생성 중...")
