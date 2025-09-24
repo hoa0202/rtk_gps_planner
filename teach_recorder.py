@@ -26,11 +26,16 @@ class TeachRecorder(Node):
         self.declare_parameter('sample_dist', 0.30)            # 샘플 간격 [m]
         self.declare_parameter('origin_lat', 0.0)              # 0이면 첫 fix로 자동 원점 설정
         self.declare_parameter('origin_lon', 0.0)
+        # Lever offsets (antenna -> base). Positive y is left, positive x is forward
+        self.declare_parameter('lever_ax', -0.64)
+        self.declare_parameter('lever_ay', 0.05)
 
         self.save_csv   = self.get_parameter('save_csv').get_parameter_value().string_value
         self.sample_dist= float(self.get_parameter('sample_dist').value)
         self.origin_lat = float(self.get_parameter('origin_lat').value)
         self.origin_lon = float(self.get_parameter('origin_lon').value)
+        self.lever_ax   = float(self.get_parameter('lever_ax').value)
+        self.lever_ay   = float(self.get_parameter('lever_ay').value)
 
         # ENU 근사(이퀴레탱귤러)
         self.R = 6378137.0
@@ -45,7 +50,7 @@ class TeachRecorder(Node):
 
         # ROS IO
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix', self.on_gps, 10)
-        self.sub_imu = self.create_subscription(Imu,        '/imu2',     self.on_imu, 10)
+        self.sub_imu = self.create_subscription(Imu,        '/imu/data',     self.on_imu, 10)
         self.timer   = self.create_timer(0.05, self.spin)  # 20 Hz
 
         self.get_logger().info('[TeachRecorder] Start. Recording every %.2f m' % self.sample_dist)
@@ -78,19 +83,28 @@ class TeachRecorder(Node):
         r, p, y = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.yaw = y
 
+    def antenna_to_base(self, x_ant, y_ant, yaw):
+        # Convert antenna position to base center using lever offsets
+        dx = self.lever_ax*math.cos(yaw) - self.lever_ay*math.sin(yaw)
+        dy = self.lever_ax*math.sin(yaw) + self.lever_ay*math.cos(yaw)
+        return (x_ant - dx, y_ant - dy)
+
     def spin(self):
         if self.x is None or self.y is None:
             return
+        # Convert current antenna pos to base frame
+        xb, yb = self.antenna_to_base(self.x, self.y, self.yaw)
+
         if self.last_x is None:
-            self.path.append((self.x, self.y, self.yaw))
-            self.last_x, self.last_y = self.x, self.y
+            self.path.append((xb, yb, self.yaw))
+            self.last_x, self.last_y = xb, yb
             return
-        d = math.hypot(self.x - self.last_x, self.y - self.last_y)
+        d = math.hypot(xb - self.last_x, yb - self.last_y)
         if d >= self.sample_dist:
-            # Calculate heading from actual movement instead of IMU yaw
-            actual_heading = math.atan2(self.y - self.last_y, self.x - self.last_x)
-            self.path.append((self.x, self.y, actual_heading))  # Use movement-based heading
-            self.last_x, self.last_y = self.x, self.y
+            # Calculate heading from actual movement in base frame
+            actual_heading = math.atan2(yb - self.last_y, xb - self.last_x)
+            self.path.append((xb, yb, actual_heading))  # record base-frame path
+            self.last_x, self.last_y = xb, yb
 
     def destroy_node(self):
         # Save CSV (첫 줄에 ORIGIN)

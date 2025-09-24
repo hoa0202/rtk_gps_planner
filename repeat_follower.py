@@ -37,7 +37,7 @@ class RepeatFollower(Node):
         self.declare_parameter('follow_speed_slow', 0.15)     # Slow speed (sharp corners)
         self.declare_parameter('follow_speed_scale', 1.3)     # Global speed scale factor
         self.declare_parameter('v_min', 0.18)
-        self.declare_parameter('r_stop', 0.25)  # increased from 0.10 for earlier stop
+        self.declare_parameter('r_stop', 0.35)  # relaxed for reliable final stop
         # Stanley gains (reduced for stability)
         self.declare_parameter('k_th', 0.5)  # was 1.1
         self.declare_parameter('k_s', 0.3)   # was 1.0  
@@ -56,12 +56,12 @@ class RepeatFollower(Node):
         self.declare_parameter('spin_time', 3.0)
         # Tube (increased for better tracking)
         self.declare_parameter('e_tube', 0.25)  # was 0.10
-        # Yaw bias & lever
+        # Yaw bias & lever (matching TF configuration)
         self.declare_parameter('yaw_bias', 0.0)
-        self.declare_parameter('lever_ax', 0.0)  # GPS offset
-        self.declare_parameter('lever_ay', 0.0)  # GPS offset
-        self.declare_parameter('imu_offset_x', 0.0)  # IMU offset
-        self.declare_parameter('imu_offset_y', 0.0)  # IMU offset
+        self.declare_parameter('lever_ax', -0.64)  # GPS offset: x=-0.64m (rear)
+        self.declare_parameter('lever_ay', 0.05)   # GPS offset: y=+0.05m (left)
+        self.declare_parameter('imu_offset_x', 0.0)  # IMU offset: x=-0.64m (rear)
+        self.declare_parameter('imu_offset_y', 0.0)  # IMU offset: y=-0.22m (right)
         # Near-omega scaling
         self.declare_parameter('omega_near_d0', 0.40)
         # FOLLOW_LOCK distance
@@ -135,7 +135,7 @@ class RepeatFollower(Node):
         self.x_pre=self.x0 - self.ux*self.pre_gap; self.y_pre=self.y0 - self.uy*self.pre_gap
 
         # ---------- State ----------
-        self.state='GOTO_PRESTART'
+        self.state='APPROACH_START'  # Simplified: directly approach start point
         self.dt=0.05
         self.x_ant=None; self.y_ant=None; self.yaw_imu=0.0
         self.state_enter_t=time.time(); self.spin_tacc=0.0
@@ -146,6 +146,11 @@ class RepeatFollower(Node):
 
         # auto yaw-bias accumulators
         self.calib_sum=0.0; self.calib_n=0
+        # approach phase latch to prevent oscillation near start
+        self.approach_locked=False
+        # approach progress tracker (for stuck detection)
+        self.approach_best_dist=float('inf')
+        self.approach_last_check=time.time()
         
         # Actual path recording
         self.actual_path = []
@@ -157,11 +162,11 @@ class RepeatFollower(Node):
 
         # ROS I/O
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix', self.on_gps, 10)
-        self.sub_imu = self.create_subscription(Imu,        '/imu2',     self.on_imu, 10)
+        self.sub_imu = self.create_subscription(Imu,        '/imu/data',     self.on_imu, 10)
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
         self.timer   = self.create_timer(self.dt, self.loop)
 
-        self.get_logger().info(f'[Follower v5] pts={len(self.path)} state=GOTO_PRESTART')
+        self.get_logger().info(f'[Follower v5] pts={len(self.path)} state=APPROACH_START')
 
     # ---------- Helpers ----------
     def lla2xy(self, lat, lon):
@@ -172,22 +177,106 @@ class RepeatFollower(Node):
     def base_from_antenna(self, x_ant, y_ant, yaw):
         """Convert GPS antenna position to robot base center"""
         if self.lever_ax==0.0 and self.lever_ay==0.0: return x_ant,y_ant
+        
+        # LOG: GPS offset info for debugging  
+        if not hasattr(self, '_gps_offset_logged'):
+            self.get_logger().info(f'[GPS_OFFSET] Applied: x={self.lever_ax:.2f}m, y={self.lever_ay:.2f}m')
+            self._gps_offset_logged = True
+            
         dx=self.lever_ax*math.cos(yaw)-self.lever_ay*math.sin(yaw)
         dy=self.lever_ax*math.sin(yaw)+self.lever_ay*math.cos(yaw)
         return (x_ant-dx, y_ant-dy)
     
-    def compensate_imu_offset(self, x_base, y_base, yaw_imu):
-        """Compensate for IMU position offset from robot center"""
-        if self.imu_offset_x==0.0 and self.imu_offset_y==0.0: return x_base, y_base, yaw_imu
+    def get_corrected_imu_heading(self, yaw_raw):
+        """Get corrected robot heading considering IMU offset"""
         
-        # IMU position in global coordinates
-        dx_imu = self.imu_offset_x*math.cos(yaw_imu) - self.imu_offset_y*math.sin(yaw_imu)
-        dy_imu = self.imu_offset_x*math.sin(yaw_imu) + self.imu_offset_y*math.cos(yaw_imu)
-        x_imu = x_base + dx_imu
-        y_imu = y_base + dy_imu
+        # LOG: IMU offset info for debugging (once)
+        if not hasattr(self, '_imu_offset_logged'):
+            if self.imu_offset_x != 0.0 or self.imu_offset_y != 0.0:
+                self.get_logger().info(f'[IMU_OFFSET] Applied: x={self.imu_offset_x:.2f}m, y={self.imu_offset_y:.2f}m')
+                offset_dist = math.hypot(self.imu_offset_x, self.imu_offset_y)
+                self.get_logger().info(f'[IMU_OFFSET] Distance from robot center: {offset_dist:.2f}m')
+                self.get_logger().info(f'[IMU_OFFSET] Heading: Corrected for offset position')
+            else:
+                self.get_logger().info(f'[IMU_OFFSET] No offset applied - IMU at robot center')
+            self._imu_offset_logged = True
+            
+        # Apply heading correction based on IMU offset
+        yaw_corrected = yaw_raw
         
-        # For path following, we need robot center position but IMU heading
-        return x_base, y_base, yaw_imu  # position stays at robot center, use IMU heading
+        if self.imu_offset_x != 0.0 or self.imu_offset_y != 0.0:
+            # For IMU not at robot center, we need to account for offset effects
+            # Main correction: IMU heading represents rigid body rotation
+            # Additional small correction for offset position (typically minimal)
+            
+            # Store previous heading for angular velocity calculation
+            if not hasattr(self, '_prev_yaw'):
+                self._prev_yaw = yaw_raw
+                self._prev_time = time.time()
+            
+            current_time = time.time()
+            dt = current_time - self._prev_time
+            
+            if dt > 0.01 and dt < 0.5:  # Valid time interval
+                angular_velocity = wrap(yaw_raw - self._prev_yaw) / dt
+                
+                # Small correction for IMU offset during rotation
+                # This accounts for the fact that IMU is not at rotation center
+                if abs(angular_velocity) > 0.1:  # Significant rotation
+                    # Calculate offset distance and angle
+                    offset_distance = math.hypot(self.imu_offset_x, self.imu_offset_y)
+                    
+                    # Small angular correction based on offset position
+                    # This is typically very small for well-calibrated systems
+                    offset_correction = angular_velocity * offset_distance * 0.001  # Very small factor
+                    
+                    # Clamp correction to prevent instability
+                    offset_correction = max(-0.01, min(0.01, offset_correction))  # ±0.01 rad max
+                    
+                    yaw_corrected = yaw_raw + offset_correction
+                    
+                    # Debug log for significant corrections
+                    if abs(offset_correction) > 0.005:  # > 0.3 degrees
+                        if not hasattr(self, '_correction_logged'):
+                            self.get_logger().info(f'[IMU_CORRECTION] Angular vel: {angular_velocity:.3f} rad/s, correction: {math.degrees(offset_correction):.2f}°')
+                            self._correction_logged = True
+            
+            # Update history
+            self._prev_yaw = yaw_raw
+            self._prev_time = current_time
+        
+        return yaw_corrected
+    
+    def get_robot_center_position(self, x_gps_ant, y_gps_ant, yaw_imu):
+        """Get robot center position from GPS antenna and IMU data with full offset correction"""
+        
+        # STEP 1: Get corrected IMU heading
+        yaw_corrected = self.get_corrected_imu_heading(yaw_imu)
+        
+        # STEP 2: Convert GPS antenna position to robot center using corrected heading
+        x_base, y_base = self.base_from_antenna(x_gps_ant, y_gps_ant, yaw_corrected)
+        
+        # STEP 3: Apply IMU offset correction for position and heading
+        if self.imu_offset_x != 0.0 or self.imu_offset_y != 0.0:
+            # IMU position correction: Account for IMU not being at robot center
+            # When robot rotates, IMU traces a circle around robot center
+            
+            # Calculate IMU position in global coordinates
+            imu_x_global = x_base + self.imu_offset_x * math.cos(yaw_corrected) - self.imu_offset_y * math.sin(yaw_corrected)
+            imu_y_global = y_base + self.imu_offset_x * math.sin(yaw_corrected) + self.imu_offset_y * math.cos(yaw_corrected)
+            
+            # For position: Robot center is already correctly calculated by GPS offset
+            # For heading: IMU heading is robot heading (same rigid body)
+            # No additional correction needed for pure translational offset
+            
+            # DEBUG: Show IMU position for verification
+            if not hasattr(self, '_imu_pos_logged'):
+                self.get_logger().info(f'[IMU_POSITION] Robot center: ({x_base:.2f}, {y_base:.2f})')
+                self.get_logger().info(f'[IMU_POSITION] IMU location: ({imu_x_global:.2f}, {imu_y_global:.2f})')
+                self.get_logger().info(f'[IMU_POSITION] IMU measures robot heading (rigid body assumption)')
+                self._imu_pos_logged = True
+        
+        return x_base, y_base, yaw_corrected
     
     def calculate_path_curvature(self, idx):
         """Calculate smoothed path curvature using 5-point window"""
@@ -325,13 +414,35 @@ class RepeatFollower(Node):
     # ---------- Main loop ----------
     def loop(self):
         if self.x_ant is None: return
-        x_base,y_base = self.base_from_antenna(self.x_ant,self.y_ant,self.yaw_imu)
+        
+        # Get robot center position with full offset correction
+        x_base, y_base, yaw_corrected = self.get_robot_center_position(self.x_ant, self.y_ant, self.yaw_imu)
+        
+        # DEBUG: Check GPS/IMU status periodically
+        current_time = time.time()
+        if not hasattr(self, '_status_log_time'):
+            self._status_log_time = current_time
+            
+        if current_time - self._status_log_time > 2.0:  # Every 2 seconds
+            gps_status = f"GPS: {'OK' if self.x_ant is not None else 'NO_DATA'}"
+            if self.x_ant is not None:
+                gps_status += f" ant=({self.x_ant:.2f}, {self.y_ant:.2f}) → base=({x_base:.2f}, {y_base:.2f})"
+            
+            # Show heading correction (even if minimal)
+            heading_change = abs(yaw_corrected - self.yaw_imu)
+            if heading_change > 0.001:  # 0.06 degrees
+                imu_status = f"IMU: {math.degrees(self.yaw_imu):.1f}° → {math.degrees(yaw_corrected):.1f}° (Δ{math.degrees(heading_change):.1f}°)"
+            else:
+                imu_status = f"IMU: {math.degrees(yaw_corrected):.1f}° (no correction)"
+                
+            self.get_logger().info(f"[STATUS] {gps_status}")
+            self.get_logger().info(f"[STATUS] {imu_status}, State: {self.state}")
+            self._status_log_time = current_time
         
         # Record actual path during FOLLOW state
         if self.record_actual_path and self.state == 'FOLLOW':
-            current_time = time.time()
             if current_time - self.last_record_time >= self.record_interval:
-                self.actual_path.append((x_base, y_base, self.yaw_imu, current_time))
+                self.actual_path.append((x_base, y_base, yaw_corrected, current_time))
                 self.last_record_time = current_time
 
         # Enhanced final stop with gradual approach
@@ -350,54 +461,117 @@ class RepeatFollower(Node):
 
         cmd=Twist()
 
-        # GOTO_PRESTART
-        if self.state=='GOTO_PRESTART':
-            dx=self.x_pre-x_base; dy=self.y_pre-y_base
-            dist=math.hypot(dx,dy); bearing=math.atan2(dy,dx)
-            yaw_err=wrap(bearing - self.yaw_imu)
-            v_cmd=max(self.v_min, min(self.v_max, 0.25 + 0.3*dist))
-            omega=self.omega_near_scale(self.k_th*yaw_err, dist)
-            cmd.linear.x=v_cmd; cmd.angular.z=omega; self.pub_cmd.publish(cmd)
-            if dist < self.r_pre: self.enter_state('ALIGN_START')
-            return
-
-        # ALIGN_START
-        if self.state=='ALIGN_START':
+        # APPROACH_START: Single-stage approach and alignment
+        if self.state=='APPROACH_START':
             s,ey = self.signed_progress_and_lateral(x_base,y_base)
-            yaw_err_line = wrap(self.yaw_first - self.yaw_imu)
+            yaw_err_line = wrap(self.yaw_first - yaw_corrected)
             
-            # SIMPLIFIED: Just use line heading error (no bearing blend)
-            theta_cmd = yaw_err_line
-            v_cmd=max(self.v_min, min(self.v_max, 0.20))  # fixed speed
-            omega=self.omega_near_scale(self.k_th*theta_cmd, 1.0)  # no distance scaling
-            
-            # Keep original for debug logging
+            # Calculate distance and bearing to start point (0,0)
             dx=self.x0-x_base; dy=self.y0-y_base
             dist0=math.hypot(dx,dy); bearing0=math.atan2(dy,dx)
-            theta_blend = wrap(0.5*yaw_err_line + 0.5*(bearing0 - self.yaw_imu))
+            yaw_err_bearing = wrap(bearing0 - yaw_corrected)
             
-            # DEBUG: ALIGN_START detailed logging
-            if hasattr(self, '_align_log') and time.time() - self._align_log > 0.5:
-                self.get_logger().info(f'[ALIGN] pos=({x_base:.2f},{y_base:.2f}), target=({self.x0:.2f},{self.y0:.2f})')
-                self.get_logger().info(f'[ALIGN] yaw_imu={math.degrees(self.yaw_imu):.1f}°, yaw_first={math.degrees(self.yaw_first):.1f}°, bearing0={math.degrees(bearing0):.1f}°')
-                self.get_logger().info(f'[ALIGN] s={s:.3f}, ey={ey:.3f}, dist0={dist0:.3f}')
-                self.get_logger().info(f'[ALIGN] yaw_err_line={math.degrees(yaw_err_line):.1f}°, theta_cmd={math.degrees(theta_cmd):.1f}°, omega={omega:.3f}')
-                self._align_log = time.time()
-            elif not hasattr(self, '_align_log'):
-                self._align_log = time.time()
+            # TWO-PHASE WITH HYSTERESIS: far=REACH_START, near=ALIGN_LINE, latch near
+            if self.approach_locked or dist0 <= 1.0:
+                # PHASE 2: ALIGN WITH LINE - focus on heading alignment
+                theta_cmd = 0.3 * yaw_err_bearing + 0.7 * yaw_err_line
+                phase = "ALIGN_LINE"
+                self.approach_locked = True
+            elif dist0 >= 1.2:
+                # PHASE 1: REACH START POINT - ignore line, focus on position
+                theta_cmd = yaw_err_bearing
+                phase = "REACH_START"
+            else:
+                # inside hysteresis band, keep current choice (default to ALIGN_LINE for safety)
+                theta_cmd = 0.3 * yaw_err_bearing + 0.7 * yaw_err_line
+                phase = "ALIGN_LINE"
+            
+            # Turn-in-place guard: if target is mostly behind, rotate first
+            turn_in_place = (abs(yaw_err_bearing) > math.radians(100.0))
+
+            # Phase-based control parameters
+            if phase == "REACH_START":
+                # PHASE 1: Aggressive approach to start point
+                if turn_in_place:
+                    v_cmd = 0.0
+                else:
+                    # scale forward speed by heading alignment to avoid sideways orbiting
+                    align_scale = max(0.0, math.cos(abs(yaw_err_bearing)))
+                    v_cmd = max(0.0, min(self.v_max, (0.12 + 0.20*min(dist0, 1.0)) * align_scale))
+                theta_limit = math.pi/2  # ±90° - allow sharp turns
+                # Limit spin rate to avoid big CCW rotation near start
+                omega_limit = 0.8 if turn_in_place else (0.5 if dist0 < 2.0 else 0.8)
+            else:
+                # PHASE 2: Fine alignment with line
+                v_cmd = max(self.v_min, min(self.v_max, 0.10 + 0.08*min(dist0, 0.5)))  # Slower for precision
+                theta_limit = math.pi/4  # ±45° - more conservative
+                omega_limit = 0.3  # Lower angular velocity for stability
+                
+            # Apply limits
+            theta_cmd = max(-theta_limit, min(theta_limit, theta_cmd))
+            omega_raw = self.k_th * theta_cmd
+            omega = self.omega_near_scale(omega_raw, dist0)
+            omega = max(-omega_limit, min(omega_limit, omega))
+            
+            # DEBUG: APPROACH_START logging - simplified single stage
+            if hasattr(self, '_approach_log') and time.time() - self._approach_log > 0.5:
+                limit_info = f"±{math.degrees(theta_limit):.0f}°"
+                
+                if phase == "REACH_START":
+                    phase_info = "🎯 REACH_START (100% bearing)"
+                    control_info = f"Moving toward start point (0,0)"
+                else:
+                    phase_info = "⚖️ ALIGN_LINE (30% bearing + 70% line)"
+                    control_info = f"Fine alignment with path direction"
+                
+                # Show progress toward completion
+                close_enough = (dist0 <= 0.20)
+                aligned_enough = (abs(yaw_err_line) <= math.radians(15))
+                progress = f"{'✅' if close_enough else '❌'}Close({dist0:.2f}m≤0.20m) {'✅' if aligned_enough else '❌'}Aligned({abs(math.degrees(yaw_err_line)):.1f}°≤15°)"
+                
+                self.get_logger().info(f'[APPROACH] pos=({x_base:.2f},{y_base:.2f}), target=(0,0), dist={dist0:.3f}m')
+                self.get_logger().info(f'[APPROACH] {phase_info} - {control_info}')  
+                self.get_logger().info(f'[APPROACH] Progress: {progress}')
+                self.get_logger().info(f'[APPROACH] yaw_err_line={math.degrees(yaw_err_line):.1f}°, yaw_err_bearing={math.degrees(yaw_err_bearing):.1f}°')
+                self.get_logger().info(f'[APPROACH] theta_cmd={math.degrees(theta_cmd):.1f}° (lim:{limit_info}), omega={omega:.3f}')
+                self._approach_log = time.time()
+            elif not hasattr(self, '_approach_log'):
+                self._approach_log = time.time()
                 
             cmd.linear.x=v_cmd; cmd.angular.z=omega; self.pub_cmd.publish(cmd)
 
-            passed = (s >= self.s_gate) and (abs(ey) <= self.gate_w) and (abs(yaw_err_line) <= self.yaw_tol)
-            if passed:
-                # init s_hat and lock end
+            # PRACTICAL CONDITIONS: allow entry to FOLLOW when reasonably close
+            close_enough = (dist0 <= 0.80)  # Within 0.8m of start point
+            aligned_enough = (abs(yaw_err_line) <= math.radians(25))  # Within ±25°
+            
+            if close_enough and aligned_enough:
+                self.get_logger().info(f'[APPROACH] ✅ Ready to start! dist={dist0:.2f}m, yaw_err={math.degrees(yaw_err_line):.1f}°')
+                # Initialize projection window and lock distance, then do yaw-bias calibration
                 s_proj,_,_,_,si = self.project_to_path(x_base,y_base, start_idx=0, window=self.proj_window)
-                self.s_hat=max(0.0, s_proj); self.lock_s_end=min(self.total_len, self.s_hat + self.lock_dist)
+                self.s_hat=max(0.0, s_proj)
+                self.lock_s_end=min(self.total_len, self.s_hat + self.lock_dist)
                 self.last_seg_idx=si
                 # reset yaw calib accumulators
                 self.calib_sum=0.0; self.calib_n=0
                 self.enter_state('FOLLOW_LOCK')
             return
+
+            # STUCK FALLBACK: if distance not improving for 5s and still >0.6m, start FOLLOW_LOCK
+            now = time.time()
+            self.approach_best_dist = min(self.approach_best_dist, dist0)
+            if now - self.approach_last_check > 5.0:
+                improved = self.approach_prev_dist - self.approach_best_dist if hasattr(self, 'approach_prev_dist') else 0.0
+                self.approach_prev_dist = self.approach_best_dist
+                self.approach_last_check = now
+                if self.approach_best_dist > 0.60 and improved < 0.10:
+                    s_proj,_,_,_,si = self.project_to_path(x_base,y_base, start_idx=0, window=self.proj_window)
+                    self.s_hat=max(0.0, s_proj)
+                    self.lock_s_end=min(self.total_len, self.s_hat + self.lock_dist)
+                    self.last_seg_idx=si
+                    self.calib_sum=0.0; self.calib_n=0
+                    self.get_logger().info(f'[APPROACH] ⚠️ STUCK_FALLBACK → FOLLOW_LOCK (dist={dist0:.2f}m, best_improve={improved:.2f}m/5s)')
+                    self.enter_state('FOLLOW_LOCK')
+                    return
 
         # FOLLOW_LOCK: lead=0, v=v_min, mono projection; also collect yaw-bias samples
         if self.state=='FOLLOW_LOCK':
@@ -410,18 +584,18 @@ class RepeatFollower(Node):
             xt,yt,ux,uy,i = self.point_on_path(self.s_hat)
             dx=xt-x_base; dy=yt-y_base
             h_path=math.atan2(uy,ux)
-            theta_e=wrap(h_path - self.yaw_imu)  # line heading error (not bearing)
+            theta_e=wrap(h_path - yaw_corrected)  # line heading error (not bearing)
 
             # collect yaw bias (IMU - path heading)
-            yaw_diff = wrap(self.yaw_imu - h_path)
+            yaw_diff = wrap(yaw_corrected - h_path)
             self.calib_sum += yaw_diff; self.calib_n += 1
             if self.calib_n % 20 == 0:  # log every 20 samples
                 avg_bias = self.calib_sum / self.calib_n
                 self.get_logger().info(f'[Follower v5] yaw calib: IMU={self.yaw_imu:.3f}, path={h_path:.3f}, diff={yaw_diff:.3f}, avg={avg_bias:.3f} (n={self.calib_n})')
             # standard Stanley w/o lead, on small v
             v_cmd=self.v_min
-            x_b=math.cos(-self.yaw_imu)*dx - math.sin(-self.yaw_imu)*dy
-            y_b=math.sin(-self.yaw_imu)*dx + math.cos(-self.yaw_imu)*dy
+            x_b=math.cos(-yaw_corrected)*dx - math.sin(-yaw_corrected)*dy
+            y_b=math.sin(-yaw_corrected)*dx + math.cos(-yaw_corrected)*dy
             e_yc=y_b
             omega_cmd = self.k_th*theta_e + self.k_s*math.atan2(self.k_e*e_yc, v_cmd + self.eps)
             omega=self.omega_near_scale(omega_cmd, math.hypot(dx,dy))
@@ -502,21 +676,21 @@ class RepeatFollower(Node):
                 if dist_to_goal < 0.3:
                     # Very close: minimal steering, focus on stopping
                     target_bearing = math.atan2(dy, dx)
-                    yaw_error = wrap(target_bearing - self.yaw_imu)
+                    yaw_error = wrap(target_bearing - yaw_corrected)
                     # Reduce yaw error magnitude for stability
                     if abs(yaw_error) > math.pi/2:  # > 90 degrees
                         yaw_error = yaw_error * 0.3  # Reduce aggressive turning
                 else:
                     # Close: normal steering to final point
                     target_bearing = math.atan2(dy, dx)
-                    yaw_error = wrap(target_bearing - self.yaw_imu)
+                    yaw_error = wrap(target_bearing - yaw_corrected)
             else:
                 # Normal operation: use lookahead
                 xt, yt, _ = self.path[target_idx]
                 dx = xt - x_base
                 dy = yt - y_base
                 target_bearing = math.atan2(dy, dx)
-                yaw_error = wrap(target_bearing - self.yaw_imu)
+                yaw_error = wrap(target_bearing - yaw_corrected)
             
             # Adaptive speed and steering
             dist_goal = math.hypot(self.path[-1][0]-x_base, self.path[-1][1]-y_base)
