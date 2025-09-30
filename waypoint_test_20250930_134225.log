@@ -1,0 +1,12 @@
+[INFO] [1759207347.207093096] [simple_waypoint_follower]: 🎯 Simple Waypoint Follower!
+[INFO] [1759207347.207892232] [simple_waypoint_follower]: 📍 Waypoints: 2개
+[INFO] [1759207347.208624776] [simple_waypoint_follower]:   1. (35.93518039, 126.92529373)
+[INFO] [1759207347.209231688] [simple_waypoint_follower]:   2. (35.93518711, 126.92516670)
+[WARN] [1759207347.230144584] [simple_waypoint_follower]: ⚠️  대기 중... 없는 값: x, y
+[INFO] [1759207348.180407784] [simple_waypoint_follower]: 🌍 Origin: (35.93517574, 126.92532591)
+[INFO] [1759207349.229318056] [simple_waypoint_follower]: WP1/2: pos=(-0.00,0.00), target=(-2.90,0.52), dist=2.95m, heading_err=-51.0°, v=0.00, ω=-0.50
+[INFO] [1759207350.279502888] [simple_waypoint_follower]: WP1/2: pos=(0.01,0.00), target=(-2.90,0.52), dist=2.95m, heading_err=-35.6°, v=0.00, ω=-0.50
+[INFO] [1759207351.280956904] [simple_waypoint_follower]: WP1/2: pos=(0.02,0.01), target=(-2.90,0.52), dist=2.97m, heading_err=-16.4°, v=0.08, ω=-0.29
+[INFO] [1759207352.329272392] [simple_waypoint_follower]: WP1/2: pos=(-0.05,0.11), target=(-2.90,0.52), dist=2.88m, heading_err=-5.5°, v=0.08, ω=-0.10
+[INFO] [1759207353.379074760] [simple_waypoint_follower]: WP1/2: pos=(-0.28,0.33), target=(-2.90,0.52), dist=2.63m, heading_err=-1.2°, v=0.08, ω=-0.02
+[INFO] [1759207354.428886056] [simple_waypoint_follower]: WP1/2: pos=(-0.50,0.56), target=(-2.90,0.52), dist=2.40m, heading_err=4.1°, v=0.08, ω=0.07

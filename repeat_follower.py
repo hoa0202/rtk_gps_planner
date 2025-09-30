@@ -31,21 +31,21 @@ class RepeatFollower(Node):
         self.declare_parameter('path_csv', 'taught_path.csv')
         self.declare_parameter('record_actual_path', True)
         self.declare_parameter('experiment_id', 1)
-        # SIMPLE Pure Pursuit parameters (실제 로봇용 안전 속도)
-        self.declare_parameter('v_max', 0.25)     # 실제 로봇용: 0.4 → 0.25
-        self.declare_parameter('v_min', 0.08)     # 실제 로봇용: 0.1 → 0.08
-        self.declare_parameter('r_stop', 0.3)     # 원본과 동일
+        # SIMPLE Pure Pursuit parameters (고정밀 추종을 위한 느린 속도)
+        self.declare_parameter('v_max', 0.10)     # SMOOTH 속도: 부드러운 주행을 위해 느리게
+        self.declare_parameter('v_min', 0.08)     # 최소 속도 감소
+        self.declare_parameter('r_stop', 0.8)     # 증가: 0.5 → 0.8 (훨씬 쉬운 도달)
         # APPROACH 단계 속도 (파라미터화)
-        self.declare_parameter('approach_speed_max', 0.20)  # REACH_START 최대 속도
-        self.declare_parameter('approach_speed_align', 0.15)  # ALIGN_LINE 속도
+        self.declare_parameter('approach_speed_max', 0.08)  # SMOOTH: 부드러운 접근 속도
+        self.declare_parameter('approach_speed_align', 0.06)  # SMOOTH: 부드러운 정렬 속도
         # FOLLOW_LOCK 속도
-        self.declare_parameter('lock_speed', 0.18)  # 캘리브레이션 속도
-        self.declare_parameter('k_th', 0.6)       # 원본과 동일
+        self.declare_parameter('lock_speed', 0.08)  # SMOOTH 캘리브레이션 속도: 부드럽게
+        self.declare_parameter('k_th', 0.5)       # STABLE 조향: 진동 방지 (0.7→0.5)
         self.declare_parameter('k_s', 0.4)        # Stanley 파라미터
         self.declare_parameter('k_e', 1.0)        # Stanley 파라미터
         self.declare_parameter('base_lookahead', 3)  # 원본과 동일
         self.declare_parameter('eps', 0.05)
-        self.declare_parameter('omega_max', 1.2)
+        self.declare_parameter('omega_max', 0.5)  # 최대 각속도 제한: 0.5 rad/s (28.6°/s) - 진동 방지
         # Legacy parameter for compatibility
         self.declare_parameter('Td', 0.18)
         # Start/Gate
@@ -54,6 +54,8 @@ class RepeatFollower(Node):
         self.declare_parameter('yaw_tol', 1.0)  # Much larger angle tolerance
         self.declare_parameter('s_gate', 0.20)
         self.declare_parameter('gate_width', 0.12)
+        # FAST START: Skip unstable GOTO_PRESTART/ALIGN_START if robot is already near path
+        self.declare_parameter('skip_alignment', True)  # 바로 FOLLOW_LOCK 시작 (추천!)
         # Spin guard
         self.declare_parameter('spin_omega', 0.8)
         self.declare_parameter('spin_dist', 0.35)
@@ -172,7 +174,15 @@ class RepeatFollower(Node):
         self.get_logger().info(f'[TF] Pre-start position (base_link): x_pre={self.x_pre:.3f}, y_pre={self.y_pre:.3f}')
 
         # ---------- State ----------
-        self.state='GOTO_PRESTART'
+        # FAST START: Skip unstable alignment states if requested
+        self.skip_alignment = self.get_parameter('skip_alignment').get_parameter_value().bool_value
+        
+        if self.skip_alignment:
+            self.state='FOLLOW_LOCK'  # 🚀 바로 안정적인 경로 추종 시작!
+            self.get_logger().info('[FAST START] ⚡ Skipping GOTO_PRESTART/ALIGN_START → Starting directly in FOLLOW_LOCK')
+        else:
+            self.state='GOTO_PRESTART'  # 전통적 방식 (불안정)
+        
         self.dt=0.033  # 30Hz for RTK balanced control
         self.yaw_imu=0.0
         self.state_enter_t=time.time(); self.spin_tacc=0.0
@@ -183,6 +193,15 @@ class RepeatFollower(Node):
 
         # auto yaw-bias accumulators
         self.calib_sum=0.0; self.calib_n=0
+        
+        # 🎯 자동 캘리브레이션 (waypoint follower 방식!)
+        self.calibrated = False
+        
+        # FOLLOW_LOCK tracking
+        if self.skip_alignment:
+            self.lock_start_time = time.time()
+            # Initialize for immediate FOLLOW_LOCK
+            self.lock_s_end = min(self.total_len, self.lock_dist)
         
         # Actual path recording
         self.actual_path = []
@@ -205,8 +224,12 @@ class RepeatFollower(Node):
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
         self.timer   = self.create_timer(self.dt, self.loop)
 
-        self.get_logger().info(f'[Follower v5] pts={len(self.path)} state=GOTO_PRESTART')
+        self.get_logger().info(f'[Follower v5] pts={len(self.path)} state={self.state}')
         self.get_logger().info(f'[TF] TF-based coordinate system ready.')
+        
+        if self.skip_alignment:
+            self.get_logger().info('[FAST START] 🚀 로봇이 시작점 근처에 있어야 합니다!')
+            self.get_logger().info('[FAST START] 📍 불안정한 정렬 단계를 스킵하고 바로 경로 추종을 시작합니다.')
 
     # ---------- Helpers ----------
     def lla2xy(self, lat, lon):
@@ -490,7 +513,21 @@ class RepeatFollower(Node):
         
         # Special case: if IMU frame is already base_link, no transform needed
         if imu_frame == self.base_frame:
-            self.yaw_imu = wrap(y + self.yaw_bias)
+            new_yaw_imu = wrap(y + self.yaw_bias)
+            
+            # 🔍 DIAGNOSTIC: IMU 큰 변화 감지
+            if hasattr(self, 'yaw_imu') and self.yaw_imu is not None:
+                yaw_imu_change = abs(wrap(new_yaw_imu - self.yaw_imu))
+                if yaw_imu_change > math.radians(10):  # >10도 변화
+                    dt = time.time() - getattr(self, 'last_imu_time', time.time())
+                    if dt > 0.001:  # 유효한 시간 간격
+                        angular_velocity = math.degrees(yaw_imu_change) / dt
+                        self.get_logger().warn('⚠️  IMU LARGE JUMP!')
+                        self.get_logger().warn(f'   Yaw: {math.degrees(self.yaw_imu):.1f}° → {math.degrees(new_yaw_imu):.1f}° (Δ{math.degrees(yaw_imu_change):+.1f}°)')
+                        self.get_logger().warn(f'   dt: {dt:.3f}s, Angular velocity: {angular_velocity:.1f}°/s')
+            
+            self.yaw_imu = new_yaw_imu
+            self.last_imu_time = time.time()
             return
         
         # Always wait for and use TF transform
@@ -511,7 +548,21 @@ class RepeatFollower(Node):
                     transform.transform.rotation.w
                 ])[2]
                 
-                self.yaw_imu = wrap(y + tf_yaw + self.yaw_bias)
+                new_yaw_imu = wrap(y + tf_yaw + self.yaw_bias)
+                
+                # 🔍 DIAGNOSTIC: IMU 큰 변화 감지
+                if hasattr(self, 'yaw_imu') and self.yaw_imu is not None:
+                    yaw_imu_change = abs(wrap(new_yaw_imu - self.yaw_imu))
+                    if yaw_imu_change > math.radians(10):  # >10도 변화
+                        dt = time.time() - getattr(self, 'last_imu_time', time.time())
+                        if dt > 0.001:  # 유효한 시간 간격
+                            angular_velocity = math.degrees(yaw_imu_change) / dt
+                            self.get_logger().warn('⚠️  IMU LARGE JUMP!')
+                            self.get_logger().warn(f'   Yaw: {math.degrees(self.yaw_imu):.1f}° → {math.degrees(new_yaw_imu):.1f}° (Δ{math.degrees(yaw_imu_change):+.1f}°)')
+                            self.get_logger().warn(f'   dt: {dt:.3f}s, Angular velocity: {angular_velocity:.1f}°/s')
+                
+                self.yaw_imu = new_yaw_imu
+                self.last_imu_time = time.time()
                 break  # Success - exit retry loop
                 
             except Exception as e:
@@ -601,6 +652,34 @@ class RepeatFollower(Node):
                 self._wait_log = time.time()
             return  # Wait for TF-transformed GPS and IMU data
         
+        # 🎯 자동 캘리브레이션 (waypoint follower 방식!)
+        # 첫 실행 시 현재 위치에서 경로 시작점까지의 방향을 계산하여 yaw_bias 보정
+        if not self.calibrated:
+            # 경로의 첫 점이 목표
+            x0, y0, _ = self.path[0]
+            dx = x0 - self.x_base
+            dy = y0 - self.y_base
+            
+            # 예상 방향 (로봇이 경로 시작점을 바라봐야 하는 방향)
+            expected_heading = math.atan2(dy, dx)
+            
+            # 실제 yaw와의 차이 = bias
+            self.yaw_bias = wrap(expected_heading - self.yaw_imu)
+            self.calibrated = True
+            
+            self.get_logger().info('=' * 60)
+            self.get_logger().info('🎯 자동 캘리브레이션 완료! (waypoint follower 방식)')
+            self.get_logger().info(f'   현재 위치: ({self.x_base:.2f}, {self.y_base:.2f})')
+            self.get_logger().info(f'   경로 시작점: ({x0:.2f}, {y0:.2f})')
+            self.get_logger().info(f'   예상 방향: {math.degrees(expected_heading):.1f}°')
+            self.get_logger().info(f'   IMU raw yaw: {math.degrees(self.yaw_imu):.1f}°')
+            self.get_logger().info(f'   계산된 yaw_bias: {math.degrees(self.yaw_bias):.1f}°')
+            self.get_logger().info(f'   보정 후 yaw: {math.degrees(wrap(self.yaw_imu + self.yaw_bias)):.1f}°')
+            self.get_logger().info('=' * 60)
+            
+            # yaw_imu에 bias 즉시 적용 (다음 루프부터는 on_imu에서 자동 적용)
+            self.yaw_imu = wrap(self.yaw_imu + self.yaw_bias)
+        
         # Record actual path during FOLLOW state
         if self.record_actual_path and self.state == 'FOLLOW':
             current_time = time.time()
@@ -608,19 +687,34 @@ class RepeatFollower(Node):
                 self.actual_path.append((self.x_base, self.y_base, self.yaw_imu, current_time))
                 self.last_record_time = current_time
 
-        # Enhanced final stop with gradual approach
+        # Enhanced final stop with gradual approach and anti-oscillation
         gx,gy,_=self.path[-1]
         dist_to_final = math.hypot(gx-self.x_base, gy-self.y_base)
         
+        # Improved stopping logic with multiple conditions - 더 쉬운 정지
         if dist_to_final < self.r_stop:
-            # Final stop
-            self.pub_cmd.publish(Twist())
-            if hasattr(self, '_final_stop_log') and time.time() - self._final_stop_log > 2.0:
-                self.get_logger().info(f'[Follower v5] 🎯 FINAL STOP! Distance: {dist_to_final:.3f}m')
-                self._final_stop_log = time.time()
-            elif not hasattr(self, '_final_stop_log'):
-                self._final_stop_log = time.time()
-            return
+            # Initialize stop tracking
+            if not hasattr(self, '_stop_tracking'):
+                self._stop_tracking = {'count': 0, 'first_time': time.time()}
+            
+            # Count consecutive stops to prevent oscillation
+            self._stop_tracking['count'] += 1
+            time_at_goal = time.time() - self._stop_tracking['first_time']
+            
+            # Final stop with EASIER conditions - 더 빨리 정지
+            # 조건: 1) 0.5m 이내 근접 OR 2) 1초 이상 목표 근처 OR 3) 5회 연속
+            if dist_to_final < 0.5 or time_at_goal > 1.0 or self._stop_tracking['count'] > 5:
+                self.pub_cmd.publish(Twist())
+                if hasattr(self, '_final_stop_log') and time.time() - self._final_stop_log > 2.0:
+                    self.get_logger().info(f'[Follower v5] 🎯 FINAL STOP! Distance: {dist_to_final:.3f}m (time: {time_at_goal:.1f}s, count: {self._stop_tracking["count"]})')
+                    self._final_stop_log = time.time()
+                elif not hasattr(self, '_final_stop_log'):
+                    self._final_stop_log = time.time()
+                return
+        else:
+            # Reset stop tracking if we move away from goal
+            if hasattr(self, '_stop_tracking'):
+                del self._stop_tracking
 
         cmd=Twist()
 
@@ -684,6 +778,7 @@ class RepeatFollower(Node):
                 self.last_seg_idx=si
                 # reset yaw calib accumulators
                 self.calib_sum=0.0; self.calib_n=0
+                self.lock_start_time = time.time()  # Track when FOLLOW_LOCK started
                 self.enter_state('FOLLOW_LOCK')
             
             # Timeout after 10 seconds to prevent getting stuck
@@ -693,11 +788,30 @@ class RepeatFollower(Node):
                 self.s_hat=max(0.0, s_proj); self.lock_s_end=min(self.total_len, self.s_hat + self.lock_dist)
                 self.last_seg_idx=si
                 self.calib_sum=0.0; self.calib_n=0
+                self.lock_start_time = time.time()  # Track when FOLLOW_LOCK started
                 self.enter_state('FOLLOW_LOCK')
             return
 
         # FOLLOW_LOCK: lead=0, v=v_min, mono projection; also collect yaw-bias samples
         if self.state=='FOLLOW_LOCK':
+            # Initialize s_hat on first entry (especially for skip_alignment mode)
+            if self.s_hat == 0.0 and not hasattr(self, '_follow_lock_initialized'):
+                s_proj_init, _, _, _, si_init = self.project_to_path(self.x_base, self.y_base, start_idx=0, window=self.proj_window)
+                self.s_hat = max(0.0, s_proj_init)
+                self.last_seg_idx = si_init
+                if not hasattr(self, 'lock_s_end') or self.lock_s_end is None:
+                    self.lock_s_end = min(self.total_len, self.s_hat + self.lock_dist)
+                self._follow_lock_initialized = True
+                # 디버그: 초기 위치 출력
+                path_start = self.path[0]
+                offset_x = self.x_base - path_start[0]
+                offset_y = self.y_base - path_start[1]
+                offset_dist = math.hypot(offset_x, offset_y)
+                self.get_logger().info(f'[FOLLOW_LOCK] 🚀 Initialized: s_hat={self.s_hat:.2f}, lock_end={self.lock_s_end:.2f}')
+                self.get_logger().info(f'[FOLLOW_LOCK] 📍 Robot pos: ({self.x_base:.3f}, {self.y_base:.3f}), Path start: ({path_start[0]:.3f}, {path_start[1]:.3f})')
+                self.get_logger().info(f'[FOLLOW_LOCK] 📏 Offset from path start: Δx={offset_x:.3f}m, Δy={offset_y:.3f}m, dist={offset_dist:.3f}m')
+                self.get_logger().info(f'[FOLLOW_LOCK] 🧭 Robot yaw: {math.degrees(self.yaw_imu):.1f}°, Path yaw: {math.degrees(path_start[2]):.1f}°')
+            
             s_proj, xp, yp, e_y, si = self.project_to_path(self.x_base,self.y_base, start_idx=self.last_seg_idx, window=self.proj_window)
             self.last_seg_idx=si
             max_adv=self.v_max*self.dt*1.5
@@ -724,13 +838,19 @@ class RepeatFollower(Node):
             omega=self.omega_near_scale(omega_cmd, math.hypot(dx,dy))
             cmd.linear.x=v_cmd; cmd.angular.z=omega; self.pub_cmd.publish(cmd)
 
-            if self.s_hat >= (self.lock_s_end or self.s_hat):
-                # apply auto yaw-bias (RTK-BALANCED: Sufficient samples for accuracy)
-                if True and self.calib_n >= 60:  # Faster calibration (was 120)
-                    delta = (self.calib_sum / self.calib_n)
-                    # smooth update (MTi-630R: can handle more aggressive correction)
-                    self.yaw_bias = wrap(self.yaw_bias - 0.5*delta)
-                    self.get_logger().info(f'[Follower v5] auto yaw bias applied: {self.yaw_bias:+.3f} rad (delta: {delta:+.3f})')
+            # Fast transition with timeout - don't wait too long for calibration
+            calibration_ready = self.calib_n >= 30  # Much faster: 30 samples instead of 60
+            timeout_ready = hasattr(self, 'lock_start_time') and (time.time() - self.lock_start_time) > 8.0
+            
+            if self.s_hat >= (self.lock_s_end or self.s_hat) or calibration_ready or timeout_ready:
+                # 🎯 waypoint follower 방식으로 이미 캘리브레이션 완료!
+                # FOLLOW_LOCK에서는 추가 캘리브레이션 하지 않음
+                
+                # 디버그: FOLLOW_LOCK yaw 데이터 출력 (참고용)
+                if self.calib_n > 0:
+                    avg_diff = self.calib_sum / self.calib_n
+                    self.get_logger().info(f'[Follower v5] 🔍 FOLLOW_LOCK yaw 확인: samples={self.calib_n}, avg_diff={avg_diff:.3f} rad ({math.degrees(avg_diff):.1f}°)')
+                self.get_logger().info(f'[Follower v5] ⚡ Using initial calibration: yaw_bias={self.yaw_bias:.3f} rad ({math.degrees(self.yaw_bias):.1f}°)')
                 self.enter_state('FOLLOW')
             return
 
@@ -810,42 +930,135 @@ class RepeatFollower(Node):
             # Calculate control with cross-track error compensation
             yaw_error = wrap(target_bearing - self.yaw_imu)
             
-            # ANTI-CORNER-CUTTING: Add cross-track error compensation
+            # ANTI-CORNER-CUTTING: Calculate cross-track error first
             cross_track_error = self.calculate_cross_track_error(self.x_base, self.y_base, closest_idx)
+            
+            # 🔍 DIAGNOSTIC: 큰 yaw_error 변화 감지
+            prev_yaw_imu = getattr(self, 'prev_yaw_imu', self.yaw_imu)
+            prev_yaw_error = getattr(self, 'prev_yaw_error', yaw_error)
+            prev_target_bearing = getattr(self, 'prev_target_bearing', target_bearing)
+            prev_closest_idx = getattr(self, 'prev_closest_idx', closest_idx)
+            prev_target_idx = getattr(self, 'prev_target_idx', target_idx)
+            
+            yaw_err_change = abs(yaw_error - prev_yaw_error)
+            target_idx_jump = abs(target_idx - prev_target_idx)
+            prev_curvature = getattr(self, 'prev_curvature', curvature)
+            curv_change = abs(curvature - prev_curvature)
+            
+            # 🔍 다중 조건 감지: yaw_error 급변, target 점프, curvature 급변
+            should_log = (
+                yaw_err_change > math.radians(20) or  # 20도 이상 변화
+                abs(yaw_error) > math.radians(40) or  # 절대값 40도 이상
+                target_idx_jump >= 2 or               # Target 2칸 이상 점프
+                curv_change > 0.1                     # Curvature 0.1 이상 급변
+            )
+            
+            if should_log:
+                imu_change = math.degrees(wrap(self.yaw_imu - prev_yaw_imu))
+                target_change = math.degrees(wrap(target_bearing - prev_target_bearing))
+                
+                # 🔍 트리거 원인 파악
+                triggers = []
+                if yaw_err_change > math.radians(20):
+                    triggers.append(f'YAW_ERR_CHANGE(Δ{math.degrees(yaw_err_change):.1f}°)')
+                if abs(yaw_error) > math.radians(40):
+                    triggers.append(f'LARGE_YAW_ERR({math.degrees(yaw_error):.1f}°)')
+                if target_idx_jump >= 2:
+                    triggers.append(f'TARGET_JUMP({prev_target_idx}→{target_idx}, +{target_idx_jump})')
+                if curv_change > 0.1:
+                    triggers.append(f'CURV_CHANGE({prev_curvature:.3f}→{curvature:.3f}, Δ{curv_change:.3f})')
+                
+                self.get_logger().warn('=' * 70)
+                self.get_logger().warn(f'⚠️  ANOMALY DETECTED: {", ".join(triggers)}')
+                self.get_logger().warn(f'   Position: ({self.x_base:.2f}, {self.y_base:.2f})')
+                self.get_logger().warn(f'   Closest: {prev_closest_idx}→{closest_idx}, Target: {prev_target_idx}→{target_idx} (jump={target_idx_jump})')
+                self.get_logger().warn(f'   Target point: ({xt:.2f}, {yt:.2f})')
+                self.get_logger().warn('-' * 70)
+                self.get_logger().warn(f'   IMU yaw: {math.degrees(prev_yaw_imu):.1f}° → {math.degrees(self.yaw_imu):.1f}° (Δ{imu_change:+.1f}°)')
+                self.get_logger().warn(f'   Target bearing: {math.degrees(prev_target_bearing):.1f}° → {math.degrees(target_bearing):.1f}° (Δ{target_change:+.1f}°)')
+                self.get_logger().warn(f'   Yaw error: {math.degrees(prev_yaw_error):.1f}° → {math.degrees(yaw_error):.1f}° (Δ{math.degrees(yaw_err_change):+.1f}°)')
+                self.get_logger().warn('-' * 70)
+                self.get_logger().warn(f'   Curvature: {prev_curvature:.3f} → {curvature:.3f} (Δ{curv_change:+.3f})')
+                self.get_logger().warn(f'   Lookahead: {lookahead_dist:.2f}m')
+                self.get_logger().warn(f'   Cross-track: {cross_track_error:.3f}m')
+                
+                # 경로 방향 체크
+                if closest_idx > 0 and closest_idx < len(self.path) - 1:
+                    x_prev, y_prev, _ = self.path[closest_idx - 1]
+                    x_curr, y_curr, _ = self.path[closest_idx]
+                    x_next, y_next, _ = self.path[closest_idx + 1]
+                    path_dir_prev = math.degrees(math.atan2(y_curr - y_prev, x_curr - x_prev))
+                    path_dir_next = math.degrees(math.atan2(y_next - y_curr, x_next - x_curr))
+                    path_dir_change = wrap(math.radians(path_dir_next - path_dir_prev))
+                    self.get_logger().warn(f'   Path direction: wp{closest_idx-1}→{closest_idx}: {path_dir_prev:.1f}°')
+                    self.get_logger().warn(f'   Path direction: wp{closest_idx}→{closest_idx+1}: {path_dir_next:.1f}° (Δ{math.degrees(path_dir_change):+.1f}°)')
+                
+                # Target point 방향 체크
+                if prev_target_idx < len(self.path):
+                    x_prev_tgt, y_prev_tgt, _ = self.path[prev_target_idx]
+                    bearing_to_prev_tgt = math.atan2(y_prev_tgt - self.y_base, x_prev_tgt - self.x_base)
+                    bearing_to_curr_tgt = math.atan2(yt - self.y_base, xt - self.x_base)
+                    bearing_jump = math.degrees(wrap(bearing_to_curr_tgt - bearing_to_prev_tgt))
+                    self.get_logger().warn(f'   Target bearing change from robot: Δ{bearing_jump:+.1f}°')
+                
+                self.get_logger().warn('=' * 70)
+            
+            self.prev_yaw_imu = self.yaw_imu
+            self.prev_yaw_error = yaw_error
+            self.prev_target_bearing = target_bearing
+            self.prev_closest_idx = closest_idx
+            self.prev_target_idx = target_idx
+            self.prev_curvature = curvature
             
             # CONSISTENT cross-track gain for reproducibility
             # Use stable, predictable control to ensure experiment consistency
             
-            # Precision-focused curvature-based gain for consistency
-            if abs(curvature) > 0.3:  # Sharp curves
-                ct_gain = 0.10  # Slightly stronger for precision
-                lookahead_dist = 2.0  # Shorter for tight tracking
-            elif abs(curvature) > 0.15:  # Medium curves
-                ct_gain = 0.15  # More aggressive for accuracy
-                lookahead_dist = 2.5  # Balanced
+            # 🎯 TRANSITION SMOOTH PATH TRACKING - 전환 부드럽게 개선
+            # FIX 1: Curvature 임계값 하향 (0.15→0.12) - Target 점프 방지
+            # FIX 2: Straight ct_gain 증가 (1.1→1.3) - 빠른 보정
+            if abs(curvature) > 0.3:  # Sharp curves (U턴 등)
+                ct_gain = 1.3
+                target_lookahead = 2.0
+            elif abs(curvature) > 0.12:  # Medium curves (0.15→0.12 낮춤!)
+                ct_gain = 1.2
+                target_lookahead = 2.3
             else:  # Straight or gentle curves
-                ct_gain = 0.08  # Stronger for precision
-                lookahead_dist = 3.0  # Full lookahead
+                ct_gain = 1.3  # IMPROVED: 빠른 보정 (1.1→1.3)
+                target_lookahead = 2.5
             
-            # Enhanced filtering for precision and consistency
-            # Low-pass filter to reduce noise sensitivity
-            alpha = 0.8  # More responsive to reduce lag (was 0.7)
+            # FIX 3: Lookahead 부드러운 전환 - 급격한 변화 방지
+            prev_lookahead = getattr(self, 'prev_lookahead', target_lookahead)
+            lookahead_dist = 0.7 * prev_lookahead + 0.3 * target_lookahead
+            self.prev_lookahead = lookahead_dist
+            
+            # Enhanced filtering for smooth and consistent tracking
+            # Low-pass filter to reduce noise and ensure smooth control
+            alpha = 0.78  # STABLE: 강한 필터링으로 급격한 변화 방지 (0.73→0.78)
             self.filtered_ct_error = alpha * cross_track_error + (1-alpha) * self.filtered_ct_error
             
             ct_correction = ct_gain * self.filtered_ct_error
             
-            # Limit cross-track correction to prevent overshoot
-            ct_correction = max(-0.2, min(0.2, ct_correction))  # ±0.2 rad/s 제한
+            # Limit cross-track correction - 진동 방지를 위한 제한
+            ct_correction = max(-0.55, min(0.55, ct_correction))  # STABLE: 진동 방지 (0.65→0.55)
             
-            # Speed control - SIMPLE (원본 방식)
-            if abs(yaw_error) > math.radians(20):  # > 20 degrees
-                v_cmd = self.v_min  # 0.1 m/s
+            # Speed control - 목표 근처에서 감속
+            # 목표점까지의 거리 계산
+            gx, gy, _ = self.path[-1]
+            dist_to_goal = math.hypot(gx - self.x_base, gy - self.y_base)
+            
+            # 목표 근처 감속 로직 (매우 완화된 조건으로 안정성 확보)
+            if dist_to_goal < 2.0:  # 2m 이내에서 감속 시작
+                v_cmd = self.v_min  # 느리게 접근
+            elif abs(cross_track_error) > 0.8:  # ct_error > 0.8m: 매우 큰 이탈만 감속
+                v_cmd = self.v_min  # 감속하여 보정 집중
+            elif abs(yaw_error) > math.radians(35):  # > 35 degrees (더 완화)
+                v_cmd = self.v_min
             else:
-                v_cmd = self.v_max  # 0.4 m/s
+                v_cmd = self.v_max
             
             # Angular velocity with cross-track compensation
             omega = self.k_th * yaw_error + ct_correction
-            omega = max(-1.0, min(1.0, omega))  # Clamp
+            omega = max(-self.omega_max, min(self.omega_max, omega))  # Clamp to omega_max
             
             # Enhanced debug log for consistent tracking
             if hasattr(self, '_simple_log') and time.time() - self._simple_log > 1.0:

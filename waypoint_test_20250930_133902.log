@@ -1,0 +1,21 @@
+[INFO] [1759207144.130167080] [simple_waypoint_follower]: 🎯 Simple Waypoint Follower!
+[INFO] [1759207144.130772136] [simple_waypoint_follower]: 📍 Waypoints: 2개
+[INFO] [1759207144.131260008] [simple_waypoint_follower]:   1. (35.93518039, 126.92529373)
+[INFO] [1759207144.131721096] [simple_waypoint_follower]:   2. (35.93518711, 126.92516670)
+[WARN] [1759207144.151583080] [simple_waypoint_follower]: ⚠️  대기 중... 없는 값: x, y, yaw
+[INFO] [1759207144.164757352] [simple_waypoint_follower]: 🌍 Origin: (35.93517703, 126.92532358)
+[INFO] [1759207145.201922728] [simple_waypoint_follower]: 🎯 고정 방향: 172.1°
+[INFO] [1759207145.203291752] [simple_waypoint_follower]: WP1/2: pos=(0.00,0.00), target=(-2.69,0.37), dist=2.72m, heading_err=-43.5°, v=0.00, ω=-0.50
+[INFO] [1759207146.253500008] [simple_waypoint_follower]: WP1/2: pos=(0.01,0.01), target=(-2.69,0.37), dist=2.72m, heading_err=-30.1°, v=0.00, ω=-0.50
+[INFO] [1759207147.301937288] [simple_waypoint_follower]: WP1/2: pos=(0.02,0.05), target=(-2.69,0.37), dist=2.73m, heading_err=-11.1°, v=0.08, ω=-0.19
+[INFO] [1759207148.303002408] [simple_waypoint_follower]: WP1/2: pos=(-0.17,0.26), target=(-2.69,0.37), dist=2.53m, heading_err=-8.0°, v=0.08, ω=-0.14
+[INFO] [1759207149.351755656] [simple_waypoint_follower]: WP1/2: pos=(-0.41,0.44), target=(-2.69,0.37), dist=2.28m, heading_err=-5.3°, v=0.08, ω=-0.09
+[INFO] [1759207150.351763560] [simple_waypoint_follower]: WP1/2: pos=(-0.58,0.64), target=(-2.69,0.37), dist=2.12m, heading_err=-3.6°, v=0.08, ω=-0.06
+[INFO] [1759207151.352020680] [simple_waypoint_follower]: WP1/2: pos=(-0.80,0.89), target=(-2.69,0.37), dist=1.96m, heading_err=-2.6°, v=0.08, ω=0.00
+[INFO] [1759207152.353045800] [simple_waypoint_follower]: WP1/2: pos=(-0.98,1.13), target=(-2.69,0.37), dist=1.87m, heading_err=-2.1°, v=0.08, ω=0.00
+[INFO] [1759207153.402294600] [simple_waypoint_follower]: WP1/2: pos=(-1.17,1.30), target=(-2.69,0.37), dist=1.78m, heading_err=-2.4°, v=0.08, ω=0.00
+[INFO] [1759207154.402365096] [simple_waypoint_follower]: WP1/2: pos=(-1.36,1.54), target=(-2.69,0.37), dist=1.77m, heading_err=-2.4°, v=0.08, ω=0.00
+[INFO] [1759207155.451979304] [simple_waypoint_follower]: WP1/2: pos=(-1.59,1.75), target=(-2.69,0.37), dist=1.76m, heading_err=-2.2°, v=0.08, ω=0.00
+[INFO] [1759207156.452031464] [simple_waypoint_follower]: WP1/2: pos=(-1.76,1.94), target=(-2.69,0.37), dist=1.82m, heading_err=-3.2°, v=0.08, ω=-0.06
+[INFO] [1759207157.454722920] [simple_waypoint_follower]: WP1/2: pos=(-1.98,2.15), target=(-2.69,0.37), dist=1.92m, heading_err=-3.2°, v=0.08, ω=-0.06
+[INFO] [1759207158.502088488] [simple_waypoint_follower]: WP1/2: pos=(-2.21,2.39), target=(-2.69,0.37), dist=2.07m, heading_err=-3.7°, v=0.08, ω=-0.06
