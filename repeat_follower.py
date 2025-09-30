@@ -31,10 +31,15 @@ class RepeatFollower(Node):
         self.declare_parameter('path_csv', 'taught_path.csv')
         self.declare_parameter('record_actual_path', True)
         self.declare_parameter('experiment_id', 1)
-        # SIMPLE Pure Pursuit parameters (GitHub 원본 방식)
-        self.declare_parameter('v_max', 0.4)      # 원본과 동일
-        self.declare_parameter('v_min', 0.1)      # 원본과 동일
+        # SIMPLE Pure Pursuit parameters (실제 로봇용 안전 속도)
+        self.declare_parameter('v_max', 0.25)     # 실제 로봇용: 0.4 → 0.25
+        self.declare_parameter('v_min', 0.08)     # 실제 로봇용: 0.1 → 0.08
         self.declare_parameter('r_stop', 0.3)     # 원본과 동일
+        # APPROACH 단계 속도 (파라미터화)
+        self.declare_parameter('approach_speed_max', 0.20)  # REACH_START 최대 속도
+        self.declare_parameter('approach_speed_align', 0.15)  # ALIGN_LINE 속도
+        # FOLLOW_LOCK 속도
+        self.declare_parameter('lock_speed', 0.18)  # 캘리브레이션 속도
         self.declare_parameter('k_th', 0.6)       # 원본과 동일
         self.declare_parameter('k_s', 0.4)        # Stanley 파라미터
         self.declare_parameter('k_e', 1.0)        # Stanley 파라미터
@@ -70,6 +75,7 @@ class RepeatFollower(Node):
         self.declare_parameter('proj_window', 120)  # increased from 60
         # DEBUG: force straight mode
         self.declare_parameter('force_straight', False)
+        self.declare_parameter('force_straight_speed', 0.15)  # 디버그 직진 속도
 
         # get params
         P = {p.name: p.value for p in self.get_parameters([n for n in self._parameters])}
@@ -77,6 +83,9 @@ class RepeatFollower(Node):
         # store - SIMPLE VERSION  
         self.Td=float(P['Td']); self.v_max=float(P['v_max']); self.v_min=float(P['v_min']); self.r_stop=float(P['r_stop'])
         self.k_th=float(P['k_th']); self.k_s=float(P['k_s']); self.k_e=float(P['k_e']); self.base_lookahead=float(P['base_lookahead']); self.eps=float(P['eps']); self.omega_max=float(P['omega_max'])
+        # APPROACH 속도 파라미터
+        self.approach_speed_max=float(P['approach_speed_max']); self.approach_speed_align=float(P['approach_speed_align'])
+        self.lock_speed=float(P['lock_speed'])
         self.pre_gap=float(P['pre_gap']); self.r_pre=float(P['r_pre']); self.yaw_tol=float(P['yaw_tol'])
         self.s_gate=float(P['s_gate']); self.gate_w=float(P['gate_width'])
         self.spin_omega=float(P['spin_omega']); self.spin_dist=float(P['spin_dist']); self.spin_time=float(P['spin_time'])
@@ -89,6 +98,7 @@ class RepeatFollower(Node):
         self.proj_window=int(P['proj_window'])
         self.dt=0.05  # 20Hz control loop (hardcoded)
         self.force_straight=bool(P['force_straight'])
+        self.force_straight_speed=float(P['force_straight_speed'])
         self.record_actual_path=bool(P['record_actual_path'])
         self.experiment_id=int(P['experiment_id'])
 
@@ -191,7 +201,7 @@ class RepeatFollower(Node):
 
         # ROS I/O
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix_main', self.on_gps, 10)
-        self.sub_imu = self.create_subscription(Imu,        '/imu_main',     self.on_imu, 10)
+        self.sub_imu = self.create_subscription(Imu,        '/imu/data',     self.on_imu, 10)
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
         self.timer   = self.create_timer(self.dt, self.loop)
 
@@ -619,7 +629,7 @@ class RepeatFollower(Node):
             dx=self.x_pre-self.x_base; dy=self.y_pre-self.y_base
             dist=math.hypot(dx,dy); bearing=math.atan2(dy,dx)
             yaw_err=wrap(bearing - self.yaw_imu)
-            v_cmd=max(self.v_min, min(self.v_max, 0.35))  # Fixed higher speed
+            v_cmd=max(self.v_min, min(self.v_max, self.approach_speed_max))  # 파라미터화된 접근 속도
             omega=1.0*yaw_err  # Direct control without distance scaling
             cmd.linear.x=v_cmd; cmd.angular.z=omega; self.pub_cmd.publish(cmd)
             if dist < self.r_pre: self.enter_state('ALIGN_START')
@@ -639,11 +649,11 @@ class RepeatFollower(Node):
                 # Navigate TO the path start point
                 bearing_to_start = math.atan2(dy, dx)
                 theta_cmd = wrap(bearing_to_start - self.yaw_imu)
-                v_cmd = 0.3  # Moderate speed to approach
+                v_cmd = self.approach_speed_max  # 파라미터화된 접근 속도
             else:
                 # Close to path - align with path direction
                 theta_cmd = yaw_err_line
-                v_cmd = 0.2  # Slower for alignment
+                v_cmd = self.approach_speed_align  # 파라미터화된 정렬 속도
             
             # Control
             if abs(theta_cmd) < 0.02:
@@ -706,7 +716,7 @@ class RepeatFollower(Node):
                 avg_bias = self.calib_sum / self.calib_n
                 self.get_logger().info(f'[Follower v5] yaw calib: IMU={self.yaw_imu:.3f}, path={h_path:.3f}, diff={yaw_diff:.3f}, avg={avg_bias:.3f} (n={self.calib_n})')
             # standard Stanley w/o lead, on faster v for quicker calibration
-            v_cmd=0.25  # Faster than v_min (0.1) for quicker progress
+            v_cmd=self.lock_speed  # 파라미터화된 캘리브레이션 속도
             x_b=math.cos(-self.yaw_imu)*dx - math.sin(-self.yaw_imu)*dy
             y_b=math.sin(-self.yaw_imu)*dx + math.cos(-self.yaw_imu)*dy
             e_yc=y_b
@@ -728,7 +738,7 @@ class RepeatFollower(Node):
         if self.state=='FOLLOW':
             # DEBUG: Force straight mode
             if self.force_straight:
-                cmd.linear.x = 0.2
+                cmd.linear.x = self.force_straight_speed  # 파라미터화된 디버그 속도
                 cmd.angular.z = 0.0
                 self.pub_cmd.publish(cmd)
                 if hasattr(self, '_force_log') and time.time() - self._force_log > 2.0:

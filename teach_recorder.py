@@ -56,7 +56,7 @@ class TeachRecorder(Node):
 
         # ROS IO
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix_main', self.on_gps, 10)
-        self.sub_imu = self.create_subscription(Imu,        '/imu_main',     self.on_imu, 10)
+        self.sub_imu = self.create_subscription(Imu,        '/imu/data',     self.on_imu, 10)
         self.timer   = self.create_timer(0.05, self.spin)  # 20 Hz
 
         self.get_logger().info('[TeachRecorder] Start. Recording every %.2f m in base_link frame via TF' % self.sample_dist)
