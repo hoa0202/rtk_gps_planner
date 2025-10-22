@@ -31,8 +31,8 @@ def main():
         print(f"⚠️  로봇을 시작점 (0,0) 근처로 이동시켰는지 확인하세요!")
         input("준비 완료 후 Enter를 누르세요: ")
     
-    # repeat_follower 실행
-    cmd = f"python3 repeat_follower.py --ros-args -p experiment_id:={exp_id} -p record_actual_path:=true"
+    # simple_follower 실행 (새로운 깔끔한 코드)
+    cmd = f"python3 simple_follower.py --ros-args -p experiment_id:={exp_id} -p record_actual_path:=true"
     print(f"실행 명령어: {cmd}")
     print("시작합니다...")
     

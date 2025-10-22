@@ -51,8 +51,13 @@ class TeachRecorder(Node):
         # State (base_link coordinates via TF)
         self.x_base = None; self.y_base = None
         self.yaw_base = 0.0
+        self.yaw_raw = None  # Raw IMU yaw (before TF transform)
         self.path = []  # (x,y,yaw) in base_link frame
         self.last_x = None; self.last_y = None
+        
+        # IMU calibration (collected throughout entire path for accuracy)
+        self.imu_bias_samples = []  # Collect multiple samples during path recording
+        self.imu_bias_saved = False
 
         # ROS IO
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix_main', self.on_gps, 10)
@@ -143,6 +148,9 @@ class TeachRecorder(Node):
         q = m.orientation
         r, p, y = euler_from_quaternion([q.x, q.y, q.z, q.w])
         
+        # Save raw IMU yaw (for calibration)
+        self.yaw_raw = y
+        
         # MANDATORY TF TRANSFORM: Get IMU orientation relative to base_link
         imu_frame = m.header.frame_id if m.header.frame_id else 'imu_link'
         
@@ -180,17 +188,69 @@ class TeachRecorder(Node):
         if self.x_base is None or self.y_base is None:
             return  # Wait for TF-transformed coordinates
         if self.last_x is None:
+            # First point
             self.path.append((self.x_base, self.y_base, self.yaw_base))
             self.last_x, self.last_y = self.x_base, self.y_base
             return
+        
         d = math.hypot(self.x_base - self.last_x, self.y_base - self.last_y)
         if d >= self.sample_dist:
             # Calculate heading from actual movement in base_link frame
             actual_heading = math.atan2(self.y_base - self.last_y, self.x_base - self.last_x)
+            
+            # ========== IMU CALIBRATION SAMPLE COLLECTION ==========
+            # Collect bias samples during STRAIGHT segments for maximum accuracy
+            if self.yaw_raw is not None and len(self.path) >= 2:
+                # Check if this is a straight segment (small yaw change)
+                prev_heading = self.path[-1][2]
+                heading_change = abs(wrap(actual_heading - prev_heading))
+                
+                # Only collect samples from straight segments (< 10 degrees change)
+                if heading_change < math.radians(10):
+                    # Calculate bias: yaw_raw - actual_movement_direction
+                    # actual_heading = direction robot moved (ground truth!)
+                    # yaw_raw = what IMU reports
+                    # bias = yaw_raw - actual_heading
+                    bias_sample = wrap(self.yaw_raw - actual_heading)
+                    self.imu_bias_samples.append(bias_sample)
+            # ======================================================
+            
             self.path.append((self.x_base, self.y_base, actual_heading))  # base_link coordinates
             self.last_x, self.last_y = self.x_base, self.y_base
 
     def destroy_node(self):
+        # ========== SAVE IMU CALIBRATION (AVERAGED FROM ALL SAMPLES) ==========
+        if self.imu_bias_samples and not self.imu_bias_saved:
+            # Calculate average bias using circular statistics (for angles)
+            sum_sin = sum(math.sin(b) for b in self.imu_bias_samples)
+            sum_cos = sum(math.cos(b) for b in self.imu_bias_samples)
+            avg_bias = math.atan2(sum_sin, sum_cos)
+            
+            # Calculate standard deviation (for quality check)
+            deviations = [abs(wrap(b - avg_bias)) for b in self.imu_bias_samples]
+            std_dev = math.sqrt(sum(d**2 for d in deviations) / len(deviations)) if deviations else 0.0
+            
+            try:
+                with open('imu_calibration.txt', 'w') as f:
+                    f.write(f'{avg_bias}\n')
+                self.imu_bias_saved = True
+                
+                print('=' * 60)
+                print('🎯 IMU Calibration Saved (ROBUST MULTI-SAMPLE METHOD)!')
+                print('=' * 60)
+                print(f'   Samples collected: {len(self.imu_bias_samples)} (from straight segments)')
+                print(f'   Average bias:      {math.degrees(avg_bias):.1f}°')
+                print(f'   Std deviation:     {math.degrees(std_dev):.2f}° (consistency)')
+                print(f'   Quality: {"✅ EXCELLENT" if std_dev < math.radians(5) else "⚠️ FAIR" if std_dev < math.radians(10) else "❌ POOR"}')
+                print('   💾 Saved to: imu_calibration.txt')
+                print('   ✅ All future experiments will use this calibration!')
+                print('=' * 60)
+            except Exception as e:
+                print(f'Failed to save IMU calibration: {e}')
+        elif not self.imu_bias_samples:
+            print('⚠️  No IMU bias samples collected (path too short or no straight segments)')
+        # =======================================================================
+        
         # Save CSV (base_link coordinates via TF transforms)
         if self.path:
             with open(self.save_csv, 'w', newline='') as f:

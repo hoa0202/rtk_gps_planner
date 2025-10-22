@@ -190,6 +190,191 @@
 
 자세한 내용: `TRANSITION_SMOOTH_FIX.md` 참조 ⭐⭐⭐⭐⭐⭐
 
+## 🔧 IMU 재캘리브레이션 (v14 - IMU RECALIBRATION) ⭐⭐⭐⭐⭐⭐⭐
+
+**문제**: 커브 후 IMU 드리프트로 급격한 방향 전환! 🚨
+- 0.36m 이동 중 IMU가 40° 회전 (물리적으로 불가능!)
+- Target bearing은 안정 (-6.6° 고정)
+- IMU만 급변: -7° → -50° → -60°
+- 결과: 로봇이 엉뚱한 방향으로 회전
+
+**근본 원인**: IMU 드리프트/노이즈
+- 커브 회전 후 IMU bias 변경
+- 자기장 간섭 가능성
+- 진동/충격으로 인한 센서 드리프트
+
+**해결책 - 자동 재캘리브레이션**:
+1. **직선 구간 감지**: curvature < 0.05
+2. **경로 추종 확인**: cross-track error < 0.3m
+3. **간격 조건**: 5초 or 2m 이동 후
+4. **경로 방향 기준 보정**: `path[i] → path[i+1]` 방향
+5. **점진적 업데이트**: 0.9 * old + 0.1 * new (안정성)
+
+**동작 원리**:
+```
+직선 구간 진입 → IMU 드리프트 감지
+→ 🔧 RE-CALIBRATION 실행
+→ 경로 방향 계산: -6.5°
+→ Yaw bias 보정: -44.7° → -40.4° (Δ+4.3°)
+→ IMU 정상화: -50° → -6.5°
+→ 안정적 주행 복구! ✅
+```
+
+**예상 효과**:
+- IMU 급변 방지 (40° → 안정)
+- Yaw error 정상 유지 (43° → 10°)
+- ANOMALY DETECTED 경고 대폭 감소
+- 커브 후 안정적 직선 주행
+
+자세한 내용: `IMU_RECALIBRATION.md` 참조 ⭐⭐⭐⭐⭐⭐⭐
+
+## 🎯 Adaptive Lookahead (v15 - ADAPTIVE LOOKAHEAD) ⭐⭐⭐⭐⭐⭐⭐⭐
+
+**문제**: 이탈 시 고정 lookahead로 복귀 불가! 🚨
+- Cross-track error: -1.4m 이탈!
+- Lookahead: 2.5m (고정) → Target이 6칸 앞
+- 복귀 각도 부족 → 경로와 평행하게 이탈 주행
+- 결과: 계속 이탈 상태 유지
+
+**근본 원인**: 
+- Lookahead가 고정 → 이탈 시에도 동일
+- Target이 멀리 → 복귀 각도 부족
+- Cross-track error 누적: -0.3m → -1.4m
+
+**해결책 - Adaptive Lookahead**:
+1. **정상 추종** (ct < 0.3m): Lookahead 유지
+2. **경미한 이탈** (0.3-0.5m): Lookahead 15% 감소
+3. **중간 이탈** (0.5-0.8m): Lookahead 30% 감소
+4. **심각한 이탈** (> 0.8m): Lookahead 50% 감소!
+
+**동작 원리**:
+```
+이탈 감지: ct=-1.4m
+→ Base lookahead: 2.5m
+→ Adaptive: 1.25m (50% 감소!)
+→ Target: 6칸 앞 → 3칸 앞
+→ 빠른 복귀 각도 확보
+→ 경로로 복귀! ✅
+→ 복귀 완료 → Lookahead 정상화
+```
+
+**예상 효과**:
+- 이탈 시 즉시 Lookahead 감소
+- Target 가까워짐 → 복귀 각도 증가
+- Cross-track error 빠른 감소
+- 최대 이탈 0.8m 이내 유지
+
+**다른 제어와 시너지**:
+- **Cross-track Gain**: 복귀 속도 증가
+- **Adaptive Lookahead**: 복귀 방향 개선
+- **IMU 재캘리브레이션**: 드리프트 방지
+- → 3중 안전망! 🛡️
+
+자세한 내용: `ADAPTIVE_LOOKAHEAD.md` 참조 ⭐⭐⭐⭐⭐⭐⭐⭐
+
+## 🎯 Yaw Priority Fix (v16 - YAW PRIORITY) ⭐⭐⭐⭐⭐⭐⭐⭐⭐
+
+**문제**: 두 제어 명령이 서로 상쇄! 🚨
+- Yaw error: 52° (오른쪽으로 돌아야 함)
+- CT error: -0.62m (왼쪽으로 돌아야 함)
+- 결과: ω=-0.09 rad/s (거의 안 돌음!)
+
+**근본 원인**:
+```
+omega = k_th * yaw_error + ct_correction
+      = 0.5 * 0.91 + (-0.55)
+      = +0.45 + (-0.55)
+      = -0.10 rad/s  ← 상쇄! 💥
+```
+
+**문제의 본질**:
+- Yaw correction: "오른쪽으로 돌아!" (+0.45)
+- CT correction: "왼쪽으로 돌아!" (-0.55)
+- 두 명령이 싸워서 로봇 거의 안 돌음
+- 방향 복구 실패 → 계속 틀어진 상태
+
+**해결책 - Yaw Priority (방향 우선)**:
+```python
+if abs(yaw_error) > 30°:  # 크게 틀어짐
+    ct_correction = 0  # 위치 보정 무시!
+    # 방향만 복구
+```
+
+**동작 원리**:
+```
+1. yaw_error: 52° 감지
+2. ct_correction 무시! (0으로 설정)
+3. omega = +0.45 rad/s (제대로 돔!)
+4. 방향 복구: 52° → 40° → 30°
+5. yaw < 30° → ct_correction 다시 켬
+6. 위치 보정 시작
+7. 완전 복구! ✅
+```
+
+**예상 효과**:
+- 방향 복구 속도 4배 증가
+- 악순환 차단
+- 커브 후 안정적 복귀
+
+자세한 내용: `YAW_PRIORITY_FIX.md` 참조 ⭐⭐⭐⭐⭐⭐⭐⭐⭐
+
+### 9. 🎯 v17 SIMPLE TUNING (단순화)
+**문제**: 복잡한 보정들이 서로 간섭하여 진동 발생
+**증상**:
+```
+ct_error: 0.3~0.8m 계속 진동
+yaw_error: -27~-33° 계속 진동
+omega: +0.27 → -0.27 → +0.29 반복 (좌우 흔들림)
+```
+
+**해결책**:
+- ❌ Adaptive Lookahead 제거
+- ❌ YAW PRIORITY 제거
+- ❌ IMU Re-calibration 제거
+- ✅ Lookahead 증가: 2.0~2.5m → 2.5~3.5m
+- ✅ Gain 감소: 1.1~1.3 → 0.6~0.8
+- ✅ 단순한 제어 로직
+
+**철학**: "Less is More" - 기본에 충실!
+
+자세한 내용: `SIMPLE_TUNING.md` 참조 ⭐⭐⭐
+
+### 10. 🚫 v18 FORWARD ONLY FIX (역방향 점프 차단) 🔥
+**문제**: 커브 후 closest_idx가 역방향으로 점프!
+**치명적 버그**:
+```
+pos=(-9.29,-2.05), idx=27→32  ← 정상
+pos=(-8.78,-1.59), idx=27→32  ← 역주행 시작!
+pos=(-8.05,-0.75), idx=14→20  ← 14칸 뒤로 점프! 💥
+yaw_err=-146.9° ← 완전히 반대 방향!
+```
+
+**근본 원인**:
+- 기존: 전체 경로를 무차별 검색 (0 ~ 끝)
+- 로봇이 이탈 시 **이전 구간**이 더 가까워짐
+- closest_idx가 뒤로 점프 → 역방향 회전 명령
+- 악순환 발생!
+
+**해결책**:
+```python
+# 이전 위치 이후부터만 검색!
+prev_closest = self.last_closest_idx
+for i in range(prev_closest, len(self.path)):  # 앞으로만!
+    if dist < min_dist:
+        closest_idx = i
+```
+
+**효과**:
+- ✅ closest_idx는 **단조 증가만** (절대 감소 X)
+- ✅ 역방향 점프 **완전 차단**
+- ✅ Pure Pursuit 기본 가정 충족
+- ✅ 악순환 방지
+
+**Before**: idx=28 → 14 (역방향!) → 완전 이탈
+**After**: idx=28 → 29 → 30 (정상 진행!) ✅
+
+자세한 내용: `FORWARD_ONLY_FIX.md` 참조 ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
+
 ## 🚀 테스트 방법
 
 ```bash

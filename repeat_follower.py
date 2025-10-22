@@ -212,7 +212,6 @@ class RepeatFollower(Node):
         
         # Consistency control for reproducible experiments
         self.filtered_ct_error = 0.0  # Filtered cross-track error for noise reduction
-
         # Robot base_link position (calculated from TF transforms ONLY)
         self.x_base = None
         self.y_base = None
@@ -870,16 +869,23 @@ class RepeatFollower(Node):
 
             # SIMPLE PURE PURSUIT (GitHub 원본 방식)
             
-            # Find closest point - SIMPLE VERSION
-            min_dist = float('inf')
-            closest_idx = 0
+            # Find closest point - 🎯 FIX: 절대 뒤로 가지 않음!
+            # 이전 closest_idx 이후부터만 검색 (역방향 점프 방지)
+            prev_closest = getattr(self, 'last_closest_idx', 0)
             
-            for i, path_point in enumerate(self.path):
-                px, py = path_point[0], path_point[1]  # Only x, y (path has 3 values: x,y,yaw)
+            min_dist = float('inf')
+            closest_idx = prev_closest  # 최소한 이전 위치는 유지
+            
+            # 이전 위치부터 앞으로만 검색
+            for i in range(prev_closest, len(self.path)):
+                px, py = self.path[i][0], self.path[i][1]
                 dist = math.hypot(self.x_base - px, self.y_base - py)
                 if dist < min_dist:
                     min_dist = dist
                     closest_idx = i
+            
+            # 저장 (다음 iteration에서 사용)
+            self.last_closest_idx = closest_idx
                     
             # Check if reached goal
             goal_dist = math.hypot(self.path[-1][0] - self.x_base, self.path[-1][1] - self.y_base)
@@ -933,103 +939,20 @@ class RepeatFollower(Node):
             # ANTI-CORNER-CUTTING: Calculate cross-track error first
             cross_track_error = self.calculate_cross_track_error(self.x_base, self.y_base, closest_idx)
             
-            # 🔍 DIAGNOSTIC: 큰 yaw_error 변화 감지
-            prev_yaw_imu = getattr(self, 'prev_yaw_imu', self.yaw_imu)
-            prev_yaw_error = getattr(self, 'prev_yaw_error', yaw_error)
-            prev_target_bearing = getattr(self, 'prev_target_bearing', target_bearing)
-            prev_closest_idx = getattr(self, 'prev_closest_idx', closest_idx)
-            prev_target_idx = getattr(self, 'prev_target_idx', target_idx)
-            
-            yaw_err_change = abs(yaw_error - prev_yaw_error)
-            target_idx_jump = abs(target_idx - prev_target_idx)
-            prev_curvature = getattr(self, 'prev_curvature', curvature)
-            curv_change = abs(curvature - prev_curvature)
-            
-            # 🔍 다중 조건 감지: yaw_error 급변, target 점프, curvature 급변
-            should_log = (
-                yaw_err_change > math.radians(20) or  # 20도 이상 변화
-                abs(yaw_error) > math.radians(40) or  # 절대값 40도 이상
-                target_idx_jump >= 2 or               # Target 2칸 이상 점프
-                curv_change > 0.1                     # Curvature 0.1 이상 급변
-            )
-            
-            if should_log:
-                imu_change = math.degrees(wrap(self.yaw_imu - prev_yaw_imu))
-                target_change = math.degrees(wrap(target_bearing - prev_target_bearing))
-                
-                # 🔍 트리거 원인 파악
-                triggers = []
-                if yaw_err_change > math.radians(20):
-                    triggers.append(f'YAW_ERR_CHANGE(Δ{math.degrees(yaw_err_change):.1f}°)')
-                if abs(yaw_error) > math.radians(40):
-                    triggers.append(f'LARGE_YAW_ERR({math.degrees(yaw_error):.1f}°)')
-                if target_idx_jump >= 2:
-                    triggers.append(f'TARGET_JUMP({prev_target_idx}→{target_idx}, +{target_idx_jump})')
-                if curv_change > 0.1:
-                    triggers.append(f'CURV_CHANGE({prev_curvature:.3f}→{curvature:.3f}, Δ{curv_change:.3f})')
-                
-                self.get_logger().warn('=' * 70)
-                self.get_logger().warn(f'⚠️  ANOMALY DETECTED: {", ".join(triggers)}')
-                self.get_logger().warn(f'   Position: ({self.x_base:.2f}, {self.y_base:.2f})')
-                self.get_logger().warn(f'   Closest: {prev_closest_idx}→{closest_idx}, Target: {prev_target_idx}→{target_idx} (jump={target_idx_jump})')
-                self.get_logger().warn(f'   Target point: ({xt:.2f}, {yt:.2f})')
-                self.get_logger().warn('-' * 70)
-                self.get_logger().warn(f'   IMU yaw: {math.degrees(prev_yaw_imu):.1f}° → {math.degrees(self.yaw_imu):.1f}° (Δ{imu_change:+.1f}°)')
-                self.get_logger().warn(f'   Target bearing: {math.degrees(prev_target_bearing):.1f}° → {math.degrees(target_bearing):.1f}° (Δ{target_change:+.1f}°)')
-                self.get_logger().warn(f'   Yaw error: {math.degrees(prev_yaw_error):.1f}° → {math.degrees(yaw_error):.1f}° (Δ{math.degrees(yaw_err_change):+.1f}°)')
-                self.get_logger().warn('-' * 70)
-                self.get_logger().warn(f'   Curvature: {prev_curvature:.3f} → {curvature:.3f} (Δ{curv_change:+.3f})')
-                self.get_logger().warn(f'   Lookahead: {lookahead_dist:.2f}m')
-                self.get_logger().warn(f'   Cross-track: {cross_track_error:.3f}m')
-                
-                # 경로 방향 체크
-                if closest_idx > 0 and closest_idx < len(self.path) - 1:
-                    x_prev, y_prev, _ = self.path[closest_idx - 1]
-                    x_curr, y_curr, _ = self.path[closest_idx]
-                    x_next, y_next, _ = self.path[closest_idx + 1]
-                    path_dir_prev = math.degrees(math.atan2(y_curr - y_prev, x_curr - x_prev))
-                    path_dir_next = math.degrees(math.atan2(y_next - y_curr, x_next - x_curr))
-                    path_dir_change = wrap(math.radians(path_dir_next - path_dir_prev))
-                    self.get_logger().warn(f'   Path direction: wp{closest_idx-1}→{closest_idx}: {path_dir_prev:.1f}°')
-                    self.get_logger().warn(f'   Path direction: wp{closest_idx}→{closest_idx+1}: {path_dir_next:.1f}° (Δ{math.degrees(path_dir_change):+.1f}°)')
-                
-                # Target point 방향 체크
-                if prev_target_idx < len(self.path):
-                    x_prev_tgt, y_prev_tgt, _ = self.path[prev_target_idx]
-                    bearing_to_prev_tgt = math.atan2(y_prev_tgt - self.y_base, x_prev_tgt - self.x_base)
-                    bearing_to_curr_tgt = math.atan2(yt - self.y_base, xt - self.x_base)
-                    bearing_jump = math.degrees(wrap(bearing_to_curr_tgt - bearing_to_prev_tgt))
-                    self.get_logger().warn(f'   Target bearing change from robot: Δ{bearing_jump:+.1f}°')
-                
-                self.get_logger().warn('=' * 70)
-            
-            self.prev_yaw_imu = self.yaw_imu
-            self.prev_yaw_error = yaw_error
-            self.prev_target_bearing = target_bearing
-            self.prev_closest_idx = closest_idx
-            self.prev_target_idx = target_idx
-            self.prev_curvature = curvature
-            
             # CONSISTENT cross-track gain for reproducibility
             # Use stable, predictable control to ensure experiment consistency
             
-            # 🎯 TRANSITION SMOOTH PATH TRACKING - 전환 부드럽게 개선
-            # FIX 1: Curvature 임계값 하향 (0.15→0.12) - Target 점프 방지
-            # FIX 2: Straight ct_gain 증가 (1.1→1.3) - 빠른 보정
+            # 🎯 SIMPLE PURE PURSUIT - 단순하고 안정적인 설정
+            # 진동 방지를 위해 lookahead를 길게!
             if abs(curvature) > 0.3:  # Sharp curves (U턴 등)
-                ct_gain = 1.3
-                target_lookahead = 2.0
-            elif abs(curvature) > 0.12:  # Medium curves (0.15→0.12 낮춤!)
-                ct_gain = 1.2
-                target_lookahead = 2.3
+                ct_gain = 0.8
+                lookahead_dist = 2.5  # 길게!
+            elif abs(curvature) > 0.15:  # Medium curves
+                ct_gain = 0.7
+                lookahead_dist = 3.0  # 길게!
             else:  # Straight or gentle curves
-                ct_gain = 1.3  # IMPROVED: 빠른 보정 (1.1→1.3)
-                target_lookahead = 2.5
-            
-            # FIX 3: Lookahead 부드러운 전환 - 급격한 변화 방지
-            prev_lookahead = getattr(self, 'prev_lookahead', target_lookahead)
-            lookahead_dist = 0.7 * prev_lookahead + 0.3 * target_lookahead
-            self.prev_lookahead = lookahead_dist
+                ct_gain = 0.6
+                lookahead_dist = 3.5  # 매우 길게!
             
             # Enhanced filtering for smooth and consistent tracking
             # Low-pass filter to reduce noise and ensure smooth control
@@ -1038,20 +961,14 @@ class RepeatFollower(Node):
             
             ct_correction = ct_gain * self.filtered_ct_error
             
-            # Limit cross-track correction - 진동 방지를 위한 제한
-            ct_correction = max(-0.55, min(0.55, ct_correction))  # STABLE: 진동 방지 (0.65→0.55)
+            # Limit cross-track correction - 안정적인 제한
+            ct_correction = max(-0.4, min(0.4, ct_correction))
             
-            # Speed control - 목표 근처에서 감속
-            # 목표점까지의 거리 계산
+            # Speed control - 단순하게!
             gx, gy, _ = self.path[-1]
             dist_to_goal = math.hypot(gx - self.x_base, gy - self.y_base)
             
-            # 목표 근처 감속 로직 (매우 완화된 조건으로 안정성 확보)
-            if dist_to_goal < 2.0:  # 2m 이내에서 감속 시작
-                v_cmd = self.v_min  # 느리게 접근
-            elif abs(cross_track_error) > 0.8:  # ct_error > 0.8m: 매우 큰 이탈만 감속
-                v_cmd = self.v_min  # 감속하여 보정 집중
-            elif abs(yaw_error) > math.radians(35):  # > 35 degrees (더 완화)
+            if dist_to_goal < 2.0:
                 v_cmd = self.v_min
             else:
                 v_cmd = self.v_max
