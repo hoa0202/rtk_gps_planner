@@ -45,13 +45,13 @@ class SimpleFollower(Node):
         self.k_ct = 1.2  # Cross-track gain - 강하게!
         self.r_stop = 0.4  # Stop radius
         
-        # GPS origin (from taught_path.csv header)
-        self.origin_lat = 35.935183986666665
-        self.origin_lon = 126.92527899166667
+        # GPS origin (will be loaded from taught_path.csv header)
+        self.origin_lat = None
+        self.origin_lon = None
         self.R = 6378137.0  # Earth radius
-        self.lat0 = math.radians(self.origin_lat)
-        self.lon0 = math.radians(self.origin_lon)
-        self.clat0 = math.cos(self.lat0)
+        self.lat0 = None
+        self.lon0 = None
+        self.clat0 = None
         
         # State
         self.x = None
@@ -90,7 +90,19 @@ class SimpleFollower(Node):
             with open('taught_path.csv', 'r') as f:
                 for line in f:
                     line = line.strip()
-                    # Skip comments and empty lines
+                    
+                    # Parse ORIGIN header
+                    if line.startswith('# ORIGIN,'):
+                        parts = line.split(',')
+                        self.origin_lat = float(parts[1])
+                        self.origin_lon = float(parts[2])
+                        self.lat0 = math.radians(self.origin_lat)
+                        self.lon0 = math.radians(self.origin_lon)
+                        self.clat0 = math.cos(self.lat0)
+                        self.get_logger().info(f'📍 GPS Origin: ({self.origin_lat:.8f}, {self.origin_lon:.8f})')
+                        continue
+                    
+                    # Skip other comments and empty lines
                     if line.startswith('#') or not line:
                         continue
                     
@@ -101,6 +113,9 @@ class SimpleFollower(Node):
                         y = float(parts[1])
                         yaw = float(parts[2])
                         self.path.append((x, y, yaw))
+            
+            if self.origin_lat is None or self.origin_lon is None:
+                raise ValueError('❌ ORIGIN not found in taught_path.csv!')
             
             if len(self.path) == 0:
                 raise ValueError("No path points loaded!")
