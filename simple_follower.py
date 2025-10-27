@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Simple Pure Pursuit Path Follower
+Simple Pure Pursuit Path Follower (Stabilized)
 - Direct yaw + cross-track control
-- Small lookahead (0.4m) for tight following
+- Lookahead: 0.55m for stability
 - Fixed v=0.08m/s, omega_max=0.5rad/s
+- Dead zone (4cm) to filter GPS noise
+- Low-pass filter on omega for smooth control
 - Target: < 10cm average error
 - Compatible with analyze_path_error.py
 """
@@ -40,10 +42,14 @@ class SimpleFollower(Node):
         # Pure Pursuit parameters - 속도는 절대 고정!
         self.v_fixed = 0.08  # 고정 선속도: 8 cm/s (절대 변경 금지!)
         self.omega_max = 0.5  # 고정 최대 각속도 (절대 변경 금지!)
-        self.lookahead = 0.4  # Lookahead distance - 작게! (0.4m)
-        self.k_yaw = 1.5  # Yaw error gain - 강하게!
-        self.k_ct = 1.2  # Cross-track gain - 강하게!
+        self.lookahead = 0.55  # Lookahead distance (0.55m) - 안정성 증가
+        self.k_yaw = 1.5  # Yaw error gain
+        self.k_ct = 0.9  # Cross-track gain - 떨림 방지를 위해 감소
         self.r_stop = 0.4  # Stop radius
+        
+        # Stability parameters
+        self.ct_deadzone = 0.04  # Dead zone: ignore ct_err < 4cm (GPS 노이즈 필터링)
+        self.omega_filter_alpha = 0.6  # Low-pass filter: 0=smooth, 1=responsive
         
         # GPS origin (will be loaded from taught_path.csv header)
         self.origin_lat = None
@@ -62,6 +68,7 @@ class SimpleFollower(Node):
         self.path = []
         self.last_closest_idx = 0
         self.actual_path = []
+        self.last_omega = 0.0  # For low-pass filtering
         
         # TF for coordinate transformation
         self.tf_buffer = Buffer()
@@ -298,11 +305,23 @@ class SimpleFollower(Node):
         yaw_error = wrap(target_heading - yaw)
         
         # 4. Cross-track error (perpendicular distance to closest segment)
-        ct_error = self.calculate_cross_track_error(closest_idx)
+        ct_error_raw = self.calculate_cross_track_error(closest_idx)
+        
+        # 4-1. Apply dead zone to filter GPS noise (ignore small errors)
+        if abs(ct_error_raw) < self.ct_deadzone:
+            ct_error = 0.0
+        else:
+            ct_error = ct_error_raw
         
         # 5. Simple control law: omega = k_yaw * yaw_err + k_ct * ct_err
-        omega = self.k_yaw * yaw_error + self.k_ct * ct_error
-        omega = max(-self.omega_max, min(self.omega_max, omega))
+        omega_raw = self.k_yaw * yaw_error + self.k_ct * ct_error
+        
+        # 5-1. Apply low-pass filter for smooth control (떨림 방지)
+        omega_filtered = self.omega_filter_alpha * omega_raw + (1.0 - self.omega_filter_alpha) * self.last_omega
+        self.last_omega = omega_filtered
+        
+        # 5-2. Clamp to max angular velocity
+        omega = max(-self.omega_max, min(self.omega_max, omega_filtered))
         
         # Speed control - 고정 속도 사용 (절대 변경 금지!)
         v = self.v_fixed  # 항상 0.08 m/s 고정!
@@ -317,7 +336,7 @@ class SimpleFollower(Node):
         if not hasattr(self, '_last_log') or time.time() - self._last_log > 1.0:
             self.get_logger().info(
                 f'pos=({self.x:.2f},{self.y:.2f}), closest={closest_idx}, target={target_idx}, '
-                f'yaw_err={math.degrees(yaw_error):.1f}°, ct_err={ct_error:.3f}m, '
+                f'yaw_err={math.degrees(yaw_error):.1f}°, ct_err={ct_error_raw:.3f}m, '
                 f'v={v:.2f}, ω={omega:.2f}'
             )
             self._last_log = time.time()

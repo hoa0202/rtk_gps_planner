@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-10번 반복 실험 자동 실행 스크립트
+15번 반복 실험 자동 실행 스크립트
 - 각 실험마다 로봇을 시작점으로 이동 후 대기
-- 10번 완료 후 자동으로 analyze_path_error.py 실행
+- 완료 후 자동으로 analyze_path_error.py 실행
 """
 
 import os
 import sys
 
 def main():
+    # 실험 횟수 설정 (기본 10회, 필요시 15회까지 가능)
+    num_experiments = 10
+    
     print("=" * 70)
-    print("🚀 10번 반복 실험 시작")
+    print(f"🚀 {num_experiments}번 반복 실험 시작")
     print("=" * 70)
     print()
     print("⚠️  주의사항:")
@@ -18,16 +21,18 @@ def main():
     print("  2. 각 실험 후 로봇을 다시 시작점으로 이동시켜야 합니다")
     print("  3. Ctrl+C로 언제든 중단할 수 있습니다")
     print()
+    print(f"💡 실험 횟수를 변경하려면: 코드에서 num_experiments를 수정 (최대 15회)")
+    print()
     
     input("첫 번째 실험 준비 완료 후 Enter를 누르세요: ")
     
     success_count = 0
     failed_experiments = []
     
-    for exp_id in range(1, 11):
+    for exp_id in range(1, num_experiments + 1):
         print()
         print("=" * 70)
-        print(f"📊 실험 {exp_id}/10 시작")
+        print(f"📊 실험 {exp_id}/{num_experiments} 시작")
         print("=" * 70)
         
         # 실험 실행
@@ -42,14 +47,14 @@ def main():
             failed_experiments.append(exp_id)
             
             # 실패 시 계속할지 물어봄
-            if exp_id < 10:
+            if exp_id < num_experiments:
                 response = input("계속하시겠습니까? (y/n): ")
                 if response.lower() != 'y':
                     print("실험 중단됨")
                     break
         
         # 다음 실험 준비
-        if exp_id < 10:
+        if exp_id < num_experiments:
             print()
             print(f"⏭️  다음 실험 준비:")
             print(f"   1. 로봇을 시작점 (0,0) 근처로 이동하세요")
@@ -61,7 +66,7 @@ def main():
     print("=" * 70)
     print("📊 실험 결과 요약")
     print("=" * 70)
-    print(f"✅ 성공: {success_count}/10")
+    print(f"✅ 성공: {success_count}/{num_experiments}")
     
     if failed_experiments:
         print(f"❌ 실패: {len(failed_experiments)}개 - {failed_experiments}")

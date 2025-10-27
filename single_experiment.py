@@ -4,7 +4,7 @@
 사용법: python3 single_experiment.py 1
         python3 single_experiment.py 2
         ...
-        python3 single_experiment.py 10
+        python3 single_experiment.py 15
 """
 
 import sys
@@ -18,8 +18,8 @@ def main():
     
     try:
         exp_id = int(sys.argv[1])
-        if exp_id < 1 or exp_id > 10:
-            print("실험 번호는 1-10 사이여야 합니다.")
+        if exp_id < 1 or exp_id > 15:
+            print("실험 번호는 1-15 사이여야 합니다.")
             return
     except ValueError:
         print("실험 번호는 숫자여야 합니다.")
@@ -44,7 +44,7 @@ def main():
         print(f"📁 experiment_{exp_id}_actual_path.csv 파일이 생성되었습니다.")
         
         # 다음 실험 안내
-        if exp_id < 10:
+        if exp_id < 15:
             print(f"\n다음 실험을 위해:")
             print(f"1. 로봇을 시작점 (0,0) 근처로 이동")  
             print(f"2. python3 single_experiment.py {exp_id + 1} 실행")

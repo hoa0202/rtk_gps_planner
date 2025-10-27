@@ -255,9 +255,9 @@ def main():
         reference_exp_num = int(reference_file.replace('experiment_', '').replace('_actual_path.csv', ''))
         print(f"📌 실험 {reference_exp_num}을 레퍼런스로 사용 - 비교 대상에서 제외")
     
-    # 각 실험 분석
+    # 각 실험 분석 (최대 15개까지 지원)
     experiments = []
-    for i in range(1, 11):  # 1-10
+    for i in range(1, 16):  # 1-15
         if i == reference_exp_num:
             # 레퍼런스 실험은 자기 자신과 비교하지 않음
             experiments.append(None)
