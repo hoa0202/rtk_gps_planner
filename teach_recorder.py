@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# Teach & Repeat - Recorder (TF-based)
+# Teach & Repeat - Recorder (TF-based, RTK GPS Dual Antenna Heading)
 # - 수동 주행 경로를 base_link 좌표계로 기록 (TF transforms 사용)
-# - GPS/IMU를 TF를 통해 base_link로 변환하여 저장
+# - GPS position + RTK dual antenna heading을 TF를 통해 base_link로 변환하여 저장
 # - CSV 첫 줄에 ORIGIN(원점 LLA)을 저장하여 Repeat 시 동일 좌표계를 재현
 #
 import math
 import csv
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import NavSatFix, Imu
-from geometry_msgs.msg import PointStamped
+from sensor_msgs.msg import NavSatFix
+from geometry_msgs.msg import PointStamped, QuaternionStamped
 from tf_transformations import euler_from_quaternion
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_point
@@ -51,17 +51,17 @@ class TeachRecorder(Node):
         # State (base_link coordinates via TF)
         self.x_base = None; self.y_base = None
         self.yaw_base = 0.0
-        self.yaw_raw = None  # Raw IMU yaw (before TF transform)
+        self.yaw_raw = None  # Raw GPS heading yaw (before TF transform)
         self.path = []  # (x,y,yaw) in base_link frame
         self.last_x = None; self.last_y = None
         
-        # IMU calibration (collected throughout entire path for accuracy)
-        self.imu_bias_samples = []  # Collect multiple samples during path recording
-        self.imu_bias_saved = False
+        # GPS Heading calibration (collected throughout entire path for accuracy)
+        self.heading_bias_samples = []  # Collect multiple samples during path recording
+        self.heading_bias_saved = False
 
         # ROS IO
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix_main', self.on_gps, 10)
-        self.sub_imu = self.create_subscription(Imu,        '/imu/data',     self.on_imu, 10)
+        self.sub_heading = self.create_subscription(QuaternionStamped, '/heading', self.on_heading, 10)
         self.timer   = self.create_timer(0.05, self.spin)  # 20 Hz
 
         self.get_logger().info('[TeachRecorder] Start. Recording every %.2f m in base_link frame via TF' % self.sample_dist)
@@ -144,18 +144,18 @@ class TeachRecorder(Node):
         gps_frame = m.header.frame_id if m.header.frame_id else 'gps_link'
         self.x_base, self.y_base = self.transform_to_base_link(x_gps, y_gps, gps_frame)
 
-    def on_imu(self, m: Imu):
-        q = m.orientation
+    def on_heading(self, m: QuaternionStamped):
+        q = m.quaternion
         r, p, y = euler_from_quaternion([q.x, q.y, q.z, q.w])
         
-        # Save raw IMU yaw (for calibration)
+        # Save raw GPS heading yaw (for calibration)
         self.yaw_raw = y
         
-        # MANDATORY TF TRANSFORM: Get IMU orientation relative to base_link
-        imu_frame = m.header.frame_id if m.header.frame_id else 'imu_link'
+        # MANDATORY TF TRANSFORM: Get GPS heading orientation relative to base_link
+        heading_frame = m.header.frame_id if m.header.frame_id else 'gps_link'
         
-        # Special case: if IMU frame is already base_link, no transform needed
-        if imu_frame == self.base_frame:
+        # Special case: if heading frame is already base_link, no transform needed
+        if heading_frame == self.base_frame:
             self.yaw_base = y
             return
         
@@ -164,12 +164,12 @@ class TeachRecorder(Node):
             try:
                 transform = self.tf_buffer.lookup_transform(
                     self.base_frame,
-                    imu_frame,
+                    heading_frame,
                     rclpy.time.Time(),
                     timeout=rclpy.duration.Duration(seconds=1.0)
                 )
                 
-                # Apply TF rotation offset to IMU yaw
+                # Apply TF rotation offset to GPS heading yaw
                 tf_yaw = euler_from_quaternion([
                     transform.transform.rotation.x,
                     transform.transform.rotation.y, 
@@ -198,7 +198,7 @@ class TeachRecorder(Node):
             # Calculate heading from actual movement in base_link frame
             actual_heading = math.atan2(self.y_base - self.last_y, self.x_base - self.last_x)
             
-            # ========== IMU CALIBRATION SAMPLE COLLECTION ==========
+            # ========== GPS HEADING CALIBRATION SAMPLE COLLECTION ==========
             # Collect bias samples during STRAIGHT segments for maximum accuracy
             if self.yaw_raw is not None and len(self.path) >= 2:
                 # Check if this is a straight segment (small yaw change)
@@ -209,46 +209,46 @@ class TeachRecorder(Node):
                 if heading_change < math.radians(10):
                     # Calculate bias: yaw_raw - actual_movement_direction
                     # actual_heading = direction robot moved (ground truth!)
-                    # yaw_raw = what IMU reports
+                    # yaw_raw = what GPS heading reports
                     # bias = yaw_raw - actual_heading
                     bias_sample = wrap(self.yaw_raw - actual_heading)
-                    self.imu_bias_samples.append(bias_sample)
+                    self.heading_bias_samples.append(bias_sample)
             # ======================================================
             
             self.path.append((self.x_base, self.y_base, actual_heading))  # base_link coordinates
             self.last_x, self.last_y = self.x_base, self.y_base
 
     def destroy_node(self):
-        # ========== SAVE IMU CALIBRATION (AVERAGED FROM ALL SAMPLES) ==========
-        if self.imu_bias_samples and not self.imu_bias_saved:
+        # ========== SAVE GPS HEADING CALIBRATION (AVERAGED FROM ALL SAMPLES) ==========
+        if self.heading_bias_samples and not self.heading_bias_saved:
             # Calculate average bias using circular statistics (for angles)
-            sum_sin = sum(math.sin(b) for b in self.imu_bias_samples)
-            sum_cos = sum(math.cos(b) for b in self.imu_bias_samples)
+            sum_sin = sum(math.sin(b) for b in self.heading_bias_samples)
+            sum_cos = sum(math.cos(b) for b in self.heading_bias_samples)
             avg_bias = math.atan2(sum_sin, sum_cos)
             
             # Calculate standard deviation (for quality check)
-            deviations = [abs(wrap(b - avg_bias)) for b in self.imu_bias_samples]
+            deviations = [abs(wrap(b - avg_bias)) for b in self.heading_bias_samples]
             std_dev = math.sqrt(sum(d**2 for d in deviations) / len(deviations)) if deviations else 0.0
             
             try:
-                with open('imu_calibration.txt', 'w') as f:
+                with open('heading_calibration.txt', 'w') as f:
                     f.write(f'{avg_bias}\n')
-                self.imu_bias_saved = True
+                self.heading_bias_saved = True
                 
                 print('=' * 60)
-                print('🎯 IMU Calibration Saved (ROBUST MULTI-SAMPLE METHOD)!')
+                print('🎯 GPS Heading Calibration Saved (ROBUST MULTI-SAMPLE METHOD)!')
                 print('=' * 60)
-                print(f'   Samples collected: {len(self.imu_bias_samples)} (from straight segments)')
+                print(f'   Samples collected: {len(self.heading_bias_samples)} (from straight segments)')
                 print(f'   Average bias:      {math.degrees(avg_bias):.1f}°')
                 print(f'   Std deviation:     {math.degrees(std_dev):.2f}° (consistency)')
                 print(f'   Quality: {"✅ EXCELLENT" if std_dev < math.radians(5) else "⚠️ FAIR" if std_dev < math.radians(10) else "❌ POOR"}')
-                print('   💾 Saved to: imu_calibration.txt')
+                print('   💾 Saved to: heading_calibration.txt')
                 print('   ✅ All future experiments will use this calibration!')
                 print('=' * 60)
             except Exception as e:
-                print(f'Failed to save IMU calibration: {e}')
-        elif not self.imu_bias_samples:
-            print('⚠️  No IMU bias samples collected (path too short or no straight segments)')
+                print(f'Failed to save GPS heading calibration: {e}')
+        elif not self.heading_bias_samples:
+            print('⚠️  No GPS heading bias samples collected (path too short or no straight segments)')
         # =======================================================================
         
         # Save CSV (base_link coordinates via TF transforms)

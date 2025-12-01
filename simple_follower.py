@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Simple Pure Pursuit Path Follower (Stabilized)
+Simple Pure Pursuit Path Follower (RTK GPS Dual Antenna Heading)
+- Uses RTK GPS dual antenna heading (/heading topic) - NO IMU drift!
 - Direct yaw + cross-track control
 - Lookahead: 0.55m for stability
-- Fixed v=0.08m/s, omega_max=0.5rad/s
+- Fixed v=0.15m/s, omega_max=0.5rad/s
 - Dead zone (4cm) to filter GPS noise
 - Low-pass filter on omega for smooth control
 - Target: < 10cm average error
@@ -12,8 +13,8 @@ Simple Pure Pursuit Path Follower (Stabilized)
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, PointStamped
-from sensor_msgs.msg import NavSatFix, Imu
+from geometry_msgs.msg import Twist, PointStamped, QuaternionStamped
+from sensor_msgs.msg import NavSatFix
 from tf_transformations import euler_from_quaternion
 from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import do_transform_point
@@ -40,7 +41,7 @@ class SimpleFollower(Node):
         self.record = self.get_parameter('record_actual_path').value
         
         # Pure Pursuit parameters - 속도는 절대 고정!
-        self.v_fixed = 0.08  # 고정 선속도: 8 cm/s (절대 변경 금지!)
+        self.v_fixed = 0.15  # 고정 선속도: 8 cm/s (절대 변경 금지!)
         self.omega_max = 0.5  # 고정 최대 각속도 (절대 변경 금지!)
         self.lookahead = 0.55  # Lookahead distance (0.55m) - 안정성 증가
         self.k_yaw = 1.5  # Yaw error gain
@@ -77,7 +78,7 @@ class SimpleFollower(Node):
         
         # ROS
         self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix_main', self.on_gps, 10)
-        self.sub_imu = self.create_subscription(Imu, '/imu/data', self.on_imu, 10)
+        self.sub_heading = self.create_subscription(QuaternionStamped, '/heading', self.on_heading, 10)
         self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
         self.timer = self.create_timer(0.1, self.control_loop)  # 10Hz
         
@@ -86,7 +87,7 @@ class SimpleFollower(Node):
         
         self.get_logger().info(f'🚀 Simple Follower initialized! Path: {len(self.path)} points')
         self.get_logger().info(f'📊 Experiment {self.experiment_id}, Recording: {self.record}')
-        self.get_logger().info('⏳ Waiting for GPS and IMU data...')
+        self.get_logger().info('⏳ Waiting for GPS and Heading data...')
         
         # Status timer
         self.status_timer = self.create_timer(2.0, self.print_status)
@@ -135,7 +136,7 @@ class SimpleFollower(Node):
     def print_status(self):
         """Print current status"""
         if self.x is None or self.yaw_raw is None:
-            self.get_logger().info(f'⏳ Waiting... GPS: {self.x is not None}, IMU: {self.yaw_raw is not None}')
+            self.get_logger().info(f'⏳ Waiting... GPS: {self.x is not None}, Heading: {self.yaw_raw is not None}')
         elif not self.calibrated:
             self.get_logger().info('⏳ Waiting for calibration...')
         else:
@@ -194,35 +195,34 @@ class SimpleFollower(Node):
             if self.record:
                 self.actual_path.append((self.x, self.y, time.time()))
     
-    def on_imu(self, msg):
-        """IMU callback"""
+    def on_heading(self, msg):
+        """RTK GPS Dual Antenna Heading callback"""
         # Convert quaternion to yaw
-        q = msg.orientation
+        q = msg.quaternion
         _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.yaw_raw = yaw
     
-    def calibrate_imu(self):
-        """One-time IMU calibration - load from file or auto-calibrate"""
+    def calibrate_heading(self):
+        """One-time GPS Heading calibration - load from file or auto-calibrate"""
         if self.x is None or self.yaw_raw is None:
             return False
         
         # Try to load pre-calibrated bias from file
         try:
-            with open('imu_calibration.txt', 'r') as f:
+            with open('heading_calibration.txt', 'r') as f:
                 self.yaw_bias = float(f.read().strip())
             
             self.get_logger().info('=' * 60)
-            self.get_logger().info('🎯 IMU Calibration Loaded from File!')
+            self.get_logger().info('🎯 GPS Heading Calibration Loaded from File!')
             self.get_logger().info(f'   Pre-calibrated bias: {math.degrees(self.yaw_bias):.1f}°')
-            self.get_logger().info(f'   Raw IMU yaw: {math.degrees(self.yaw_raw):.1f}°')
+            self.get_logger().info(f'   Raw GPS heading: {math.degrees(self.yaw_raw):.1f}°')
             self.get_logger().info(f'   Corrected yaw: {math.degrees(self.yaw_raw - self.yaw_bias):.1f}°')
             self.get_logger().info('=' * 60)
             return True
             
         except FileNotFoundError:
-            self.get_logger().warn('⚠️  imu_calibration.txt not found!')
-            self.get_logger().warn('   Using automatic calibration (less accurate)')
-            self.get_logger().warn('   Run "python3 calibrate_imu.py" for manual calibration')
+            self.get_logger().warn('⚠️  heading_calibration.txt not found!')
+            self.get_logger().warn('   Using automatic calibration')
         
         # Fallback: Automatic calibration using path direction
         px0, py0, _ = self.path[0]
@@ -233,9 +233,9 @@ class SimpleFollower(Node):
         self.yaw_bias = wrap(self.yaw_raw - expected_yaw)
         
         self.get_logger().info('=' * 60)
-        self.get_logger().info('🎯 IMU Calibration Complete (AUTO)!')
+        self.get_logger().info('🎯 GPS Heading Calibration Complete (AUTO)!')
         self.get_logger().info(f'   Path direction: {math.degrees(expected_yaw):.1f}°')
-        self.get_logger().info(f'   Raw IMU yaw: {math.degrees(self.yaw_raw):.1f}°')
+        self.get_logger().info(f'   Raw GPS heading: {math.degrees(self.yaw_raw):.1f}°')
         self.get_logger().info(f'   Bias: {math.degrees(self.yaw_bias):.1f}°')
         self.get_logger().info(f'   Corrected yaw: {math.degrees(expected_yaw):.1f}°')
         self.get_logger().info('=' * 60)
@@ -250,7 +250,7 @@ class SimpleFollower(Node):
         
         # One-time calibration
         if not self.calibrated:
-            self.calibrated = self.calibrate_imu()
+            self.calibrated = self.calibrate_heading()
             return
         
         # Current yaw (corrected)
