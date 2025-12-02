@@ -1,275 +1,102 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-#
-# Teach & Repeat - Recorder (TF-based, RTK GPS Dual Antenna Heading)
-# - 수동 주행 경로를 base_link 좌표계로 기록 (TF transforms 사용)
-# - GPS position + RTK dual antenna heading을 TF를 통해 base_link로 변환하여 저장
-# - CSV 첫 줄에 ORIGIN(원점 LLA)을 저장하여 Repeat 시 동일 좌표계를 재현
-#
-import math
-import csv
+"""
+Simple Path Recorder
+- GPS → local coordinates (ROS 좌표계)
+- x = North, y = -East (로봇이 북쪽을 향할 때)
+"""
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix
-from geometry_msgs.msg import PointStamped, QuaternionStamped
-from tf_transformations import euler_from_quaternion
-from tf2_ros import Buffer, TransformListener
-from tf2_geometry_msgs import do_transform_point
-import tf2_ros
-import time
+import math
 
-def wrap(a):
-    while a >  math.pi: a -= 2.0*math.pi
-    while a < -math.pi: a += 2.0*math.pi
-    return a
 
 class TeachRecorder(Node):
     def __init__(self):
         super().__init__('teach_recorder')
-
-        # Parameters
-        self.declare_parameter('save_csv', 'taught_path.csv')  # 저장 파일
-        self.declare_parameter('sample_dist', 0.15)            # RTK precision: denser sampling
-        self.declare_parameter('origin_lat', 0.0)              # 0이면 첫 fix로 자동 원점 설정
-        self.declare_parameter('origin_lon', 0.0)
-
-        self.save_csv   = self.get_parameter('save_csv').get_parameter_value().string_value
-        self.sample_dist= float(self.get_parameter('sample_dist').value)
-        self.origin_lat = float(self.get_parameter('origin_lat').value)
-        self.origin_lon = float(self.get_parameter('origin_lon').value)
-
-        # ENU 근사(이퀴레탱귤러)
-        self.R = 6378137.0
-        self.origin_set = False
-        self.lat0 = None; self.lon0 = None; self.clat0 = None
-
-        # TF system for base_link coordinate transforms
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.base_frame = 'base_link'
-
-        # State (base_link coordinates via TF)
-        self.x_base = None; self.y_base = None
-        self.yaw_base = 0.0
-        self.yaw_raw = None  # Raw GPS heading yaw (before TF transform)
-        self.path = []  # (x,y,yaw) in base_link frame
-        self.last_x = None; self.last_y = None
         
-        # GPS Heading calibration (collected throughout entire path for accuracy)
-        self.heading_bias_samples = []  # Collect multiple samples during path recording
-        self.heading_bias_saved = False
-
-        # ROS IO
-        self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix_main', self.on_gps, 10)
-        self.sub_heading = self.create_subscription(QuaternionStamped, '/heading', self.on_heading, 10)
-        self.timer   = self.create_timer(0.05, self.spin)  # 20 Hz
-
-        self.get_logger().info('[TeachRecorder] Start. Recording every %.2f m in base_link frame via TF' % self.sample_dist)
+        self.declare_parameter('save_csv', 'taught_path.csv')
+        self.declare_parameter('sample_dist', 0.15)
         
-        # Wait briefly for TF buffer to populate
-        time.sleep(0.5)
-
-    def set_origin(self, lat, lon):
-        self.lat0  = math.radians(lat)
-        self.lon0  = math.radians(lon)
-        self.clat0 = math.cos(self.lat0)
-        self.origin_set = True
-        self.get_logger().info(f'[TeachRecorder] ORIGIN set: lat={lat:.8f}, lon={lon:.8f}')
-
-    def lla2xy(self, lat, lon):
-        phi = math.radians(lat); lam = math.radians(lon)
-        x = (lam - self.lon0) * self.clat0 * self.R
-        y = (phi - self.lat0) * self.R
+        self.save_csv = self.get_parameter('save_csv').value
+        self.sample_dist = self.get_parameter('sample_dist').value
+        
+        self.origin_lat = None
+        self.origin_lon = None
+        self.path = []
+        self.last_x = None
+        self.last_y = None
+        
+        self.sub_gps = self.create_subscription(NavSatFix, '/gps/fix_main', self.gps_callback, 10)
+        
+        self.get_logger().info(f'📍 Recording every {self.sample_dist}m')
+        self.get_logger().info('⏳ Waiting for GPS...')
+    
+    def gps_to_local(self, lat, lon):
+        """GPS → ROS 좌표계 (x=North, y=-East)"""
+        R = 6378137.0
+        lat0_rad = math.radians(self.origin_lat)
+        
+        # ENU: east, north
+        east = (math.radians(lon) - math.radians(self.origin_lon)) * math.cos(lat0_rad) * R
+        north = (math.radians(lat) - math.radians(self.origin_lat)) * R
+        
+        # ROS: x=North, y=-East (로봇이 북쪽 향할 때 x가 앞)
+        x = north
+        y = -east
         return x, y
     
-    def transform_to_base_link(self, x, y, source_frame):
-        """Pure TF-based coordinate transformation - NO hardcoding"""
-        
-        # Create point in source frame
-        point_source = PointStamped()
-        point_source.header.frame_id = source_frame
-        point_source.header.stamp = self.get_clock().now().to_msg()
-        point_source.point.x = float(x)
-        point_source.point.y = float(y)
-        point_source.point.z = 0.0
-        
-        # Get TF transform - PURE TF, no assumptions
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.base_frame,  # target: base_link
-                source_frame,     # source: from topic frame_id
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=1.0)
-            )
-            
-            # Apply TF transformation
-            point_base = do_transform_point(point_source, transform)
-            x_base = float(point_base.point.x)
-            y_base = float(point_base.point.y)
-            
-            # Debug TF transformation (first few times only)
-            debug_attr = f'_tf_debug_{source_frame}'
-            if not hasattr(self, debug_attr):
-                setattr(self, debug_attr, True)
-                tx = transform.transform.translation.x
-                ty = transform.transform.translation.y
-                tz = transform.transform.translation.z
-                self.get_logger().info(f'[TEACH TF] {source_frame}→{self.base_frame} transform:')
-                self.get_logger().info(f'[TEACH TF] Translation: ({tx:.3f}, {ty:.3f}, {tz:.3f})')
-                self.get_logger().info(f'[TEACH TF] Test point: {source_frame}({x:.3f},{y:.3f}) → base_link({x_base:.3f},{y_base:.3f})')
-                
-            return x_base, y_base
-            
-        except Exception as e:
-            # TF not ready - wait and retry
-            if not hasattr(self, '_tf_wait_logged'):
-                self._tf_wait_logged = True
-                self.get_logger().warn(f'[TEACH TF] Waiting for {source_frame}→{self.base_frame} transform: {e}')
-            time.sleep(0.01)
-            return self.transform_to_base_link(x, y, source_frame)  # Recursive retry
-
-    def on_gps(self, m: NavSatFix):
-        if not math.isfinite(m.latitude) or not math.isfinite(m.longitude):
-            return
-        if not self.origin_set:
-            if self.origin_lat != 0.0 or self.origin_lon != 0.0:
-                self.set_origin(self.origin_lat, self.origin_lon)
-            else:
-                self.set_origin(m.latitude, m.longitude)
-        
-        # Convert GPS to ENU coordinates
-        x_gps, y_gps = self.lla2xy(m.latitude, m.longitude)
-        
-        # MANDATORY TF TRANSFORM: Always use TF to get base_link coordinates
-        gps_frame = m.header.frame_id if m.header.frame_id else 'gps_link'
-        self.x_base, self.y_base = self.transform_to_base_link(x_gps, y_gps, gps_frame)
-
-    def on_heading(self, m: QuaternionStamped):
-        q = m.quaternion
-        r, p, y = euler_from_quaternion([q.x, q.y, q.z, q.w])
-        
-        # Save raw GPS heading yaw (for calibration)
-        self.yaw_raw = y
-        
-        # MANDATORY TF TRANSFORM: Get GPS heading orientation relative to base_link
-        heading_frame = m.header.frame_id if m.header.frame_id else 'gps_link'
-        
-        # Special case: if heading frame is already base_link, no transform needed
-        if heading_frame == self.base_frame:
-            self.yaw_base = y
+    def gps_callback(self, msg):
+        if not math.isfinite(msg.latitude) or not math.isfinite(msg.longitude):
             return
         
-        # Always wait for and use TF transform
-        while True:
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.base_frame,
-                    heading_frame,
-                    rclpy.time.Time(),
-                    timeout=rclpy.duration.Duration(seconds=1.0)
-                )
-                
-                # Apply TF rotation offset to GPS heading yaw
-                tf_yaw = euler_from_quaternion([
-                    transform.transform.rotation.x,
-                    transform.transform.rotation.y, 
-                    transform.transform.rotation.z,
-                    transform.transform.rotation.w
-                ])[2]
-                
-                self.yaw_base = wrap(y + tf_yaw)
-                break  # Success - exit retry loop
-                
-            except Exception as e:
-                # Keep retrying TF transform - never fallback!
-                time.sleep(0.01)
-
-    def spin(self):
-        if self.x_base is None or self.y_base is None:
-            return  # Wait for TF-transformed coordinates
+        if self.origin_lat is None:
+            self.origin_lat = msg.latitude
+            self.origin_lon = msg.longitude
+            self.get_logger().info(f'📍 Origin: ({self.origin_lat:.8f}, {self.origin_lon:.8f})')
+        
+        x, y = self.gps_to_local(msg.latitude, msg.longitude)
+        
         if self.last_x is None:
-            # First point
-            self.path.append((self.x_base, self.y_base, self.yaw_base))
-            self.last_x, self.last_y = self.x_base, self.y_base
+            self.path.append((x, y))
+            self.last_x, self.last_y = x, y
+            self.get_logger().info(f'✅ Point 1: ({x:.2f}, {y:.2f})')
             return
         
-        d = math.hypot(self.x_base - self.last_x, self.y_base - self.last_y)
-        if d >= self.sample_dist:
-            # Calculate heading from actual movement in base_link frame
-            actual_heading = math.atan2(self.y_base - self.last_y, self.x_base - self.last_x)
-            
-            # ========== GPS HEADING CALIBRATION SAMPLE COLLECTION ==========
-            # Collect bias samples during STRAIGHT segments for maximum accuracy
-            if self.yaw_raw is not None and len(self.path) >= 2:
-                # Check if this is a straight segment (small yaw change)
-                prev_heading = self.path[-1][2]
-                heading_change = abs(wrap(actual_heading - prev_heading))
-                
-                # Only collect samples from straight segments (< 10 degrees change)
-                if heading_change < math.radians(10):
-                    # Calculate bias: yaw_raw - actual_movement_direction
-                    # actual_heading = direction robot moved (ground truth!)
-                    # yaw_raw = what GPS heading reports
-                    # bias = yaw_raw - actual_heading
-                    bias_sample = wrap(self.yaw_raw - actual_heading)
-                    self.heading_bias_samples.append(bias_sample)
-            # ======================================================
-            
-            self.path.append((self.x_base, self.y_base, actual_heading))  # base_link coordinates
-            self.last_x, self.last_y = self.x_base, self.y_base
-
-    def destroy_node(self):
-        # ========== SAVE GPS HEADING CALIBRATION (AVERAGED FROM ALL SAMPLES) ==========
-        if self.heading_bias_samples and not self.heading_bias_saved:
-            # Calculate average bias using circular statistics (for angles)
-            sum_sin = sum(math.sin(b) for b in self.heading_bias_samples)
-            sum_cos = sum(math.cos(b) for b in self.heading_bias_samples)
-            avg_bias = math.atan2(sum_sin, sum_cos)
-            
-            # Calculate standard deviation (for quality check)
-            deviations = [abs(wrap(b - avg_bias)) for b in self.heading_bias_samples]
-            std_dev = math.sqrt(sum(d**2 for d in deviations) / len(deviations)) if deviations else 0.0
-            
-            try:
-                with open('heading_calibration.txt', 'w') as f:
-                    f.write(f'{avg_bias}\n')
-                self.heading_bias_saved = True
-                
-                print('=' * 60)
-                print('🎯 GPS Heading Calibration Saved (ROBUST MULTI-SAMPLE METHOD)!')
-                print('=' * 60)
-                print(f'   Samples collected: {len(self.heading_bias_samples)} (from straight segments)')
-                print(f'   Average bias:      {math.degrees(avg_bias):.1f}°')
-                print(f'   Std deviation:     {math.degrees(std_dev):.2f}° (consistency)')
-                print(f'   Quality: {"✅ EXCELLENT" if std_dev < math.radians(5) else "⚠️ FAIR" if std_dev < math.radians(10) else "❌ POOR"}')
-                print('   💾 Saved to: heading_calibration.txt')
-                print('   ✅ All future experiments will use this calibration!')
-                print('=' * 60)
-            except Exception as e:
-                print(f'Failed to save GPS heading calibration: {e}')
-        elif not self.heading_bias_samples:
-            print('⚠️  No GPS heading bias samples collected (path too short or no straight segments)')
-        # =======================================================================
+        dist = math.hypot(x - self.last_x, y - self.last_y)
+        if dist >= self.sample_dist:
+            self.path.append((x, y))
+            self.last_x, self.last_y = x, y
+            self.get_logger().info(f'✅ Point {len(self.path)}: ({x:.2f}, {y:.2f})')
+    
+    def save_path(self):
+        if not self.path:
+            self.get_logger().warn('⚠️ No path!')
+            return
         
-        # Save CSV (base_link coordinates via TF transforms)
-        if self.path:
-            with open(self.save_csv, 'w', newline='') as f:
-                w = csv.writer(f)
-                w.writerow(['# ORIGIN', math.degrees(self.lat0), math.degrees(self.lon0)])
-                w.writerow(['# COLUMNS', 'x_base_link', 'y_base_link', 'yaw_base_link_rad'])
-                for (x, y, yaw) in self.path:
-                    w.writerow([f'{x:.6f}', f'{y:.6f}', f'{wrap(yaw):.6f}'])
-            print(f'[TeachRecorder] Saved {len(self.path)} base_link points -> {self.save_csv}')
-        super().destroy_node()
+        with open(self.save_csv, 'w') as f:
+            f.write(f'# ORIGIN,{self.origin_lat},{self.origin_lon}\n')
+            for x, y in self.path:
+                f.write(f'{x:.6f},{y:.6f}\n')
+        
+        self.get_logger().info(f'💾 Saved {len(self.path)} points')
+
 
 def main():
     rclpy.init()
     node = TeachRecorder()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        print('\n⚠️ Interrupted')
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        node.save_path()
+        try:
+            rclpy.shutdown()
+        except:
+            pass
+
 
 if __name__ == '__main__':
     main()
+ㅈ
