@@ -20,7 +20,7 @@ class YOLOv8Processor(Node):
         self.depth_subscription = self.create_subscription(
             Image, '/zed/zed_node/depth/depth_registered', self.depth_callback, 1)
         self.camera_info_subscription = self.create_subscription(
-            CameraInfo, '/zed/zed_node/depth/camera_info', self.camera_info_callback, 1)
+            CameraInfo, '/zed/zed_node/rgb/camera_info', self.camera_info_callback, 1)
         self.cmd_vel_subscription = self.create_subscription(
             Twist, '/cmd_vel', self.cmd_vel_callback, 10)
 
@@ -31,7 +31,7 @@ class YOLOv8Processor(Node):
 
         # 기타 변수 초기화
         self.bridge = CvBridge()  # cv_bridge 설정 (ROS 이미지 <-> OpenCV 이미지 변환)
-        self.model = YOLO('./yolov8m.pt')  # YOLOv8 모델 로드
+        self.model = YOLO('./yolov8n.pt')  # YOLOv8 모델 로드
         self.depth_image = None  # 깊이 이미지 저장 변수
         self.camera_info = None  # 카메라 정보 저장 변수
         self.image_msg = None  # RGB 이미지 메시지 저장 변수
@@ -44,7 +44,7 @@ class YOLOv8Processor(Node):
         # 추론 주기 제한 (과부하 방지)
         self.last_inference_time = 0
         self.inference_interval = 0.2  # 0.2초마다 추론 (5fps)
-        self.debug_mode = False  # True면 cv2.imshow 활성화
+        self.debug_mode = True  # True면 cv2.imshow 활성화
 
     def camera_info_callback(self, msg):
         # 카메라 정보를 저장하는 콜백 함수

@@ -2,3 +2,10 @@ experiment*
 taught_path*
 path_error_analysis*
 circular_taught_path*
+*.log
+*.txt
+*.png
+*.sh
+result\
+*.pt
+*.yaml
